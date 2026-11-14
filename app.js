@@ -175,7 +175,7 @@ function createDetectorInstance(vision, modelBuf, delegate, runningMode, scoreTh
         baseOptions: { modelAssetBuffer: modelBuf.slice(), delegate },
         runningMode,
         scoreThreshold,
-        maxResults: 30,
+        maxResults: 15,
         categoryAllowlist: ['person']
     });
 }
@@ -193,11 +193,9 @@ function loadAI() {
 
             creep = setInterval(() => setAiProgress(aiProgress + (99 - aiProgress) * 0.12), 120);
             try {
-                videoDetector = await createDetectorInstance(vision, modelBuf, 'GPU', 'VIDEO', 0.18);
-                imageDetector = await createDetectorInstance(vision, modelBuf, 'GPU', 'IMAGE', 0.15);
+                videoDetector = await createDetectorInstance(vision, modelBuf, 'GPU', 'VIDEO', 0.40);
             } catch (gpuErr) {
-                videoDetector = await createDetectorInstance(vision, modelBuf, 'CPU', 'VIDEO', 0.18);
-                imageDetector = await createDetectorInstance(vision, modelBuf, 'CPU', 'IMAGE', 0.15);
+                videoDetector = await createDetectorInstance(vision, modelBuf, 'CPU', 'VIDEO', 0.40);
             }
 
             aiReady = true;
@@ -488,20 +486,7 @@ function runDetection(now) {
             score: d.categories && d.categories[0] ? d.categories[0].score : 0,
             sig: null
         };
-    }).filter(d => d.normBox[2] > 0.003 && d.normBox[3] > 0.008);
-
-    // Kilitli hedef uzaktaysa (küçükse) veya anlık kaçırıldıysa Sniper Crop ile o bölgeyi yakınlaştırıp tara
-    if (lockedTarget && !lockedTarget.lost && (now - lastZoomInferTs > 140)) {
-        const tc = center(lockedTarget.normBox);
-        const isSmall = lockedTarget.normBox[3] < 0.22;
-        const hasNearby = dets.some(d => computeIoU(d.normBox, lockedTarget.normBox) > 0.2);
-        if (isSmall || !hasNearby) {
-            lastZoomInferTs = now;
-            const zoomCrop = Math.max(0.24, Math.min(0.50, Math.max(lockedTarget.normBox[2], lockedTarget.normBox[3]) * 2.6));
-            const zoomDets = detectZoomedRegion(tc[0], tc[1], zoomCrop);
-            if (zoomDets.length > 0) dets = mergeDetections(dets, zoomDets);
-        }
-    }
+    }).filter(d => d.score >= 0.38 && d.normBox[2] > 0.005 && d.normBox[3] > 0.012);
 
     // İzleyicide kameradan gelen uzak tespitlerle birleştir
     if (!isCamera && now - remoteDetectionsTs < 450 && remoteDetections.length > 0) {
@@ -664,27 +649,21 @@ function flashStatus(text, ms = 1600) {
     }, ms);
 }
 
-// Mıknatıs Dokunma (Snap-to-Target): Parmağın milimetrik kaymalarını affeder, doğrudan kişiye kilitlenir
+// Kesin İnsan Doğrulaması: Sadece gerçek bir insanın kutusunun içine veya sınırına dokunulduğunda çalışır
 function findPersonAt(normX, normY, list = currentDetections) {
-    let best = null, bestScore = -Infinity;
+    let best = null, bestDist = Infinity;
     for (const d of list) {
+        if (!d || d.score < 0.38) continue;
         const [x, y, w, h] = d.normBox;
         const inside = (normX >= x && normX <= x + w && normY >= y && normY <= y + h);
-        const pc = center(d.normBox);
-        const dist = Math.hypot(normX - pc[0], normY - pc[1]);
-        const boxDiag = Math.hypot(w, h);
-
-        let score = -Infinity;
         if (inside) {
-            // Kutunun tam içine dokunulduğunda en yüksek öncelik
-            score = 1000 - (dist / Math.max(0.01, boxDiag)) * 50;
-        } else if (dist < Math.max(0.16, boxDiag * 0.85)) {
-            // Kutunun yakınına dokunulduğunda parmak toleransı
-            score = 500 - dist * 1000;
+            // Doğrudan kutunun içine dokunuldu: Kesin onay!
+            return d;
         }
-
-        if (score > bestScore) {
-            bestScore = score;
+        // Kutunun hemen kenarına (maksimum %3.5 tolerans) dokunulmuşsa
+        const dist = pointToBoxDist(normX, normY, d.normBox);
+        if (dist < 0.035 && dist < bestDist) {
+            bestDist = dist;
             best = d;
         }
     }
@@ -692,48 +671,32 @@ function findPersonAt(normX, normY, list = currentDetections) {
 }
 
 function lockAt(normX, normY, fromPeer = false, fallbackBox = null) {
-    sampleFrame();
-
-    // 1. Mevcut tespitlerde ara
+    // 1. Mevcut tespitlerde doğrulanmış insan ara
     let person = findPersonAt(normX, normY, currentDetections);
 
-    // 2. Bulunamadıysa ve Sniper Crop hazırsa dokunulan noktayı yüksek çözünürlükte yakınlaştırıp tara (uzaktaki kişiler için!)
-    if (!person && imageDetector) {
-        const zoomed = detectZoomedRegion(normX, normY, 0.34);
-        if (zoomed.length > 0) {
-            currentDetections = mergeDetections(currentDetections, zoomed);
-            person = findPersonAt(normX, normY, zoomed);
-        }
-    }
-
-    // 3. Karşı cihazdan hazır kutu geldiyse onu kullan
+    // 2. Karşı cihazdan hazır insan kutusu geldiyse onu kullan
     if (!person && fallbackBox) {
         person = { normBox: fallbackBox.slice(), score: 0.85, sig: null };
     }
 
     if (!person) {
         if (!aiReady && !fromPeer) {
-            // İzleyici henüz modeli yüklerken kameraya kilit isteği gönder
             if (!isCamera && conn && conn.open) {
                 conn.send({ type: 'lock_at', normX, normY });
-                flashStatus('Kamerada kişi aranıyor…');
-                return false;
             }
             flashStatus(`Yapay zeka hazırlanıyor %${Math.round(aiProgress)}`);
             return false;
         }
         if (fromPeer) {
-            pendingLock = { normX, normY, until: performance.now() + 2500 };
+            pendingLock = { normX, normY, until: performance.now() + 1500 };
         } else {
-            // İzleyici dokunduysa kameranın da kendi yüksek çözünürlüklü akışında aramasını sağla
-            if (!isCamera && conn && conn.open) {
-                conn.send({ type: 'lock_at', normX, normY });
-            }
-            flashStatus('Burada kişi yok — bir kişiye dokunun');
+            // Boş yere dokunuldu: KESİNLİKLE KİLİTLENME VE UYAR
+            flashStatus('Kişi seçilmedi — Sadece bir insana dokunun');
         }
         return false;
     }
 
+    sampleFrame();
     const now = performance.now();
     const sig = person.sig || computeSignature(person.normBox);
     lockedTarget = {
