@@ -77,6 +77,7 @@ let aiFailed = false;
 let aiProgress = 0;
 let aiLoadPromise = null;
 let lastInferTs = 0;
+let lastZoomInferTs = 0;
 let lastVideoTime = -1;
 let lastPersonCount = -1;
 let lastSyncSendTs = 0;
@@ -476,7 +477,9 @@ function runDetection(now) {
     }
 
     const vw = vid.videoWidth, vh = vid.videoHeight;
-    sampleFrame();
+    if (lockedTarget) {
+        sampleFrame();
+    }
 
     let dets = (result.detections || []).map(d => {
         const bb = d.boundingBox;
@@ -488,11 +491,12 @@ function runDetection(now) {
     }).filter(d => d.normBox[2] > 0.003 && d.normBox[3] > 0.008);
 
     // Kilitli hedef uzaktaysa (küçükse) veya anlık kaçırıldıysa Sniper Crop ile o bölgeyi yakınlaştırıp tara
-    if (lockedTarget && !lockedTarget.lost) {
+    if (lockedTarget && !lockedTarget.lost && (now - lastZoomInferTs > 140)) {
         const tc = center(lockedTarget.normBox);
         const isSmall = lockedTarget.normBox[3] < 0.22;
         const hasNearby = dets.some(d => computeIoU(d.normBox, lockedTarget.normBox) > 0.2);
         if (isSmall || !hasNearby) {
+            lastZoomInferTs = now;
             const zoomCrop = Math.max(0.24, Math.min(0.50, Math.max(lockedTarget.normBox[2], lockedTarget.normBox[3]) * 2.6));
             const zoomDets = detectZoomedRegion(tc[0], tc[1], zoomCrop);
             if (zoomDets.length > 0) dets = mergeDetections(dets, zoomDets);
@@ -542,28 +546,49 @@ function updateTracking(now) {
     ];
     const diag = Math.hypot(t.normBox[2], t.normBox[3]);
 
-    let best = null, bestScore = -Infinity, bestIoU = 0;
+    let best = null, bestScore = -Infinity, bestIoU = 0, bestAnchorSim = 0;
     for (const d of currentDetections) {
         const iou = computeIoU(pred, d.normBox);
         const pc = center(pred), dc = center(d.normBox);
         const dist = Math.hypot(pc[0] - dc[0], pc[1] - dc[1]);
-        const sizeRatio = Math.min(area(d.normBox) / area(t.normBox), area(t.normBox) / area(d.normBox));
+        const dArea = area(d.normBox);
+        const sizeRatio = Math.min(dArea / Math.max(1e-6, t.baseArea), t.baseArea / Math.max(1e-6, dArea));
+        const dAspect = d.normBox[2] / Math.max(0.01, d.normBox[3]);
+        const aspectSim = Math.min(dAspect / Math.max(0.01, t.aspectRatio), t.aspectRatio / Math.max(0.01, dAspect));
+
         if (!d.sig) d.sig = computeSignature(d.normBox);
-        const app = sigSim(t.sig, d.sig);
+        const anchorSim = t.anchorSig ? sigSim(t.anchorSig, d.sig) : 0.6;
+        const dynamicSim = t.dynamicSig ? sigSim(t.dynamicSig, d.sig) : anchorSim;
+        // Orijinal çapa imza (%70) hedef kaymasını (ID Switch) kesin olarak engeller
+        const app = anchorSim * 0.70 + dynamicSim * 0.30;
 
         let score;
         if (!t.lost) {
-            const gate = Math.max(0.15, diag * 1.35);
-            if (dist > gate && iou < 0.04) continue;
-            if (app < 0.36 && iou < 0.28) continue;
-            score = iou * 2.2 + app * 1.6 - (dist / Math.max(0.04, diag)) * 0.45 + sizeRatio * 0.35;
+            const gate = Math.max(0.18, diag * 1.5);
+            if (dist > gate && iou < 0.03) continue;
+            // Başka bir kişi yanından geçerken benzerlik düşükse kabul etme
+            if (anchorSim < 0.42 && iou < 0.35) continue;
+            score = iou * 2.4 + app * 2.0 + aspectSim * 0.6 - (dist / Math.max(0.04, diag)) * 0.5 + sizeRatio * 0.4;
         } else {
-            if (app < 0.70 || sizeRatio < 0.22) continue;
-            score = app * 2.2 + sizeRatio * 0.35 - dist * 0.45;
+            // Kayıp durumunda geri yakalama: Sadece orijinal kişiyi (%68 benzerlik) kabul et
+            if (anchorSim < 0.68 || sizeRatio < 0.20 || aspectSim < 0.45) continue;
+            score = anchorSim * 3.0 + sizeRatio * 0.5 + aspectSim * 0.5 - dist * 0.4;
         }
 
-        if (score > bestScore) { bestScore = score; best = d; bestIoU = iou; }
+        if (score > bestScore) {
+            bestScore = score;
+            best = d;
+            bestIoU = iou;
+            bestAnchorSim = anchorSim;
+        }
     }
+
+    // Başka biriyle kesişme (Occlusion) kontrolü: İki insan yan yana gelirse imza kirlenmesini önle
+    let isConflicted = false;
+    if (best) {
+        isConflicted = currentDetections.some(other => other !== best && computeIoU(other.normBox, best.normBox) > 0.16);
+    }
+    t.isOccluded = isConflicted;
 
     // Yapay zeka bu karede kaçırdıysa NCC Piksel Şablon Takibi devreye girsin
     if (!best && !t.lost && now - t.lastSeen < 420 && t.tpl) {
@@ -577,8 +602,10 @@ function updateTracking(now) {
     if (best) {
         const cPrev = center(t.normBox), cNew = center(best.normBox);
         if (!t.lost) {
-            t.vx = t.vx * 0.62 + ((cNew[0] - cPrev[0]) / dt) * 0.38;
-            t.vy = t.vy * 0.62 + ((cNew[1] - cPrev[1]) / dt) * 0.38;
+            // Kesişme anında ani sıçramaları önle, hızı yumuşat
+            const alpha = t.isOccluded ? 0.20 : 0.38;
+            t.vx = t.vx * (1 - alpha) + ((cNew[0] - cPrev[0]) / dt) * alpha;
+            t.vy = t.vy * (1 - alpha) + ((cNew[1] - cPrev[1]) / dt) * alpha;
         } else {
             t.vx = 0; t.vy = 0;
             t.lerpBox = best.normBox.slice();
@@ -590,9 +617,14 @@ function updateTracking(now) {
         }
         t.lastUpdate = now;
 
-        if (!best.fromTemplate && best.sig && (bestIoU > 0.42 || !t.sig)) {
-            if (!t.sig) t.sig = best.sig;
-            else for (let i = 0; i < SIG_LEN; i++) t.sig[i] = t.sig[i] * 0.92 + best.sig[i] * 0.08;
+        // İmzayı sadece çakışma YOKSA ve benzerlik yüksekse hafifçe güncelle
+        if (!best.fromTemplate && best.sig && !t.isOccluded && (bestIoU > 0.45 || !t.dynamicSig)) {
+            if (!t.dynamicSig) t.dynamicSig = new Float32Array(best.sig);
+            else {
+                for (let i = 0; i < SIG_LEN; i++) {
+                    t.dynamicSig[i] = t.dynamicSig[i] * 0.94 + best.sig[i] * 0.06;
+                }
+            }
             t.tpl = extractTemplate(t.normBox) || t.tpl;
         }
 
@@ -602,7 +634,7 @@ function updateTracking(now) {
             dismissAlert(isCamera);
         }
     } else {
-        if (!t.lost && now - t.lastSeen < 480) {
+        if (!t.lost && now - t.lastSeen < 500) {
             t.normBox = [
                 Math.max(-0.2, Math.min(1, pred[0])),
                 Math.max(-0.2, Math.min(1, pred[1])),
@@ -632,16 +664,31 @@ function flashStatus(text, ms = 1600) {
     }, ms);
 }
 
+// Mıknatıs Dokunma (Snap-to-Target): Parmağın milimetrik kaymalarını affeder, doğrudan kişiye kilitlenir
 function findPersonAt(normX, normY, list = currentDetections) {
-    let best = null, bestDist = Infinity, bestArea = Infinity;
+    let best = null, bestScore = -Infinity;
     for (const d of list) {
-        const dist = pointToBoxDist(normX, normY, d.normBox);
-        const a = area(d.normBox);
-        if (dist < bestDist - 1e-4 || (Math.abs(dist - bestDist) < 1e-4 && a < bestArea)) {
-            best = d; bestDist = dist; bestArea = a;
+        const [x, y, w, h] = d.normBox;
+        const inside = (normX >= x && normX <= x + w && normY >= y && normY <= y + h);
+        const pc = center(d.normBox);
+        const dist = Math.hypot(normX - pc[0], normY - pc[1]);
+        const boxDiag = Math.hypot(w, h);
+
+        let score = -Infinity;
+        if (inside) {
+            // Kutunun tam içine dokunulduğunda en yüksek öncelik
+            score = 1000 - (dist / Math.max(0.01, boxDiag)) * 50;
+        } else if (dist < Math.max(0.16, boxDiag * 0.85)) {
+            // Kutunun yakınına dokunulduğunda parmak toleransı
+            score = 500 - dist * 1000;
+        }
+
+        if (score > bestScore) {
+            bestScore = score;
+            best = d;
         }
     }
-    return (best && bestDist < 0.09) ? best : null;
+    return best;
 }
 
 function lockAt(normX, normY, fromPeer = false, fallbackBox = null) {
@@ -688,16 +735,21 @@ function lockAt(normX, normY, fromPeer = false, fallbackBox = null) {
     }
 
     const now = performance.now();
+    const sig = person.sig || computeSignature(person.normBox);
     lockedTarget = {
         normBox: person.normBox.slice(),
         lerpBox: person.normBox.slice(),
         vx: 0, vy: 0,
-        sig: person.sig || computeSignature(person.normBox),
+        anchorSig: sig ? new Float32Array(sig) : null,
+        dynamicSig: sig ? new Float32Array(sig) : null,
         tpl: extractTemplate(person.normBox),
+        aspectRatio: person.normBox[2] / Math.max(0.01, person.normBox[3]),
+        baseArea: area(person.normBox),
         score: person.score || 0.85,
         lastSeen: now,
         lastUpdate: now,
-        lost: false
+        lost: false,
+        isOccluded: false
     };
     pendingLock = null;
     clearTimeout(statusFlashTimer);
