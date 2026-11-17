@@ -347,4 +347,67 @@ public class PersonDetectorInstrumentedTest {
         assertEquals("https://github.com/selimakclk/cam/releases/download/v2.3/CAM.apk", info.apkUrl);
         assertEquals(25300000L, info.apkSizeBytes);
     }
+
+    @Test
+    public void testLightingAndPositionShiftReIdMemory() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        PersonDetectorEngine engine = new PersonDetectorEngine(ctx);
+
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            Bitmap roomBmp = BitmapFactory.decodeStream(is);
+            assertNotNull(roomBmp);
+
+            // 1. Kişiyi solda tespit et, birkaç kareyle hafıza bankasını doldur ve kilitle
+            PersonDetectorEngine.AnalysisOutput out1 = engine.processFrame(roomBmp);
+            assertFalse(out1.persons.isEmpty());
+            TrackedPerson person = out1.persons.get(0);
+
+            PersonDetectorEngine.LockedState snap = new PersonDetectorEngine.LockedState();
+            assertEquals(PersonDetectorEngine.LockStatus.LOCKED,
+                    engine.tryLockAt(person.centerX(), person.centerY(), snap));
+            int lockedId = snap.id;
+
+            // 2. Kişi kadrajdan tamamen çıksın (alarm tetiklensin)
+            Bitmap blank = Bitmap.createBitmap(480, 360, Bitmap.Config.ARGB_8888);
+            blank.eraseColor(Color.BLACK);
+            engine.processFrame(blank);
+            Thread.sleep(1150);
+            PersonDetectorEngine.AnalysisOutput lostOut = engine.processFrame(blank);
+            assertTrue(lostOut.locked != null && lostOut.locked.lost);
+
+            // 3. Kişiyi %55 karartılmış/sıcak ışık değişimli sahnede sağ tarafa kaydırarak geri sok
+            int rw = roomBmp.getWidth(), rh = roomBmp.getHeight();
+            Bitmap shiftedDark = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas c = new android.graphics.Canvas(shiftedDark);
+            c.drawColor(Color.rgb(28, 30, 34));
+            android.graphics.Paint darkPaint = new android.graphics.Paint();
+            android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
+            cm.setScale(0.58f, 0.54f, 0.48f, 1.0f); // %45 karartılmış sıcak oda ışığı
+            darkPaint.setColorFilter(new android.graphics.ColorMatrixColorFilter(cm));
+
+            // Soldaki kişiyi alıp sahnenin sağına yerleştir (konum tamamen değişti!)
+            int srcLeft = Math.max(0, Math.round((person.nx - 0.04f) * rw));
+            int srcRight = Math.min(rw, Math.round((person.nx + person.nw + 0.04f) * rw));
+            int srcTop = Math.max(0, Math.round((person.ny - 0.03f) * rh));
+            int srcBottom = Math.min(rh, Math.round((person.ny + person.nh + 0.03f) * rh));
+            android.graphics.Rect srcRect = new android.graphics.Rect(srcLeft, srcTop, srcRight, srcBottom);
+            int dstLeft = Math.max(0, Math.round(rw * 0.55f));
+            android.graphics.Rect dstRect = new android.graphics.Rect(
+                    dstLeft, srcTop, Math.min(rw, dstLeft + srcRect.width()), srcBottom);
+            c.drawBitmap(roomBmp, srcRect, dstRect, darkPaint);
+
+            PersonDetectorEngine.AnalysisOutput rec = engine.processFrame(shiftedDark);
+            if (rec.locked != null && rec.locked.lost) {
+                rec = engine.processFrame(shiftedDark);
+            }
+            assertNotNull("Kişi karanlık/sağ konuma geçince de bulunmalı", rec.locked);
+            assertFalse("Farklı ışık ve farklı konumdaki aynı kişi Re-ID ile kurtarılmalı", rec.locked.lost);
+            assertEquals(lockedId, rec.locked.id);
+
+            shiftedDark.recycle();
+            blank.recycle();
+        } finally {
+            engine.close();
+        }
+    }
 }

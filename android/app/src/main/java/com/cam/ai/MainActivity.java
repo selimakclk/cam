@@ -620,7 +620,9 @@ public class MainActivity extends AppCompatActivity {
             newTargetText = "Kişiye dokunarak kilitleyin";
             newVis = View.GONE;
         } else if (locked.lost) {
-            newTargetText = "KAYIP: Kişi #" + locked.id + "!";
+            newTargetText = (locked.memoryCount > 0)
+                    ? ("KAYIP: Kişi #" + locked.id + "! (Hafıza: " + locked.memoryCount + ")")
+                    : ("KAYIP: Kişi #" + locked.id + "!");
             newVis = View.VISIBLE;
         } else {
             int pct = Math.round(locked.score * 100f);

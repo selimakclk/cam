@@ -40,18 +40,22 @@ public class PersonDetectorEngine {
 
     private static final int ANA_W = 160;
     private static final int ANA_H = 120;
-    private static final int HUE_BINS = 16;
-    private static final int SAT_BINS = 4;
-    private static final int GRAY_BINS = 12;
-    private static final int ZONE_LEN = HUE_BINS * SAT_BINS + GRAY_BINS; // 76
+    private static final int HUE_BINS = 12;
+    private static final int GRAY_BINS = 8;
+    private static final int ZONE_LEN = HUE_BINS + GRAY_BINS; // 20 (yumuşak dağılımlı renk+ton)
     private static final int NUM_ZONES = 3; // 0: Baş/Omuz, 1: Gövde, 2: Bacak
-    private static final int SIG_LEN = ZONE_LEN * NUM_ZONES; // 228
+    private static final int HIST_TOTAL = ZONE_LEN * NUM_ZONES; // 60
+    private static final int CHROMA_LEN = NUM_ZONES * 3; // 9 (rg, yb, luma ortalamaları)
+    private static final int PATCH_W = 6;
+    private static final int PATCH_H = 10;
+    private static final int PATCH_LEN = PATCH_W * PATCH_H; // 60 (aydınlatmadan bağımsız yapısal vücut deseni)
+    private static final int SIG_LEN = HIST_TOTAL + CHROMA_LEN + PATCH_LEN; // 129
     private static final int TPL_W = 16;
     private static final int TPL_H = 24;
 
-    private static final int MAX_LOCKED_GALLERY = 8;
-    private static final int MAX_ROOM_MEMORY = 24;
-    private static final long ROOM_MEMORY_TTL_MS = 90_000L;
+    private static final int MAX_LOCKED_GALLERY = 12;
+    private static final int MAX_ROOM_MEMORY = 28;
+    private static final long ROOM_MEMORY_TTL_MS = 300_000L; // 5 dakika kalıcı oda hafızası
     private static final long TARGET_LOST_TIMEOUT_MS = 1100L;
 
     public enum LockStatus {
@@ -67,11 +71,12 @@ public class PersonDetectorEngine {
         public float baseArea;
         public float aspectRatio;
         public float[] anchorSig;
-        public List<float[]> gallery; // Slot 0 = değişmez anchor, 1..7 = temiz çoklu açı hafızası
+        public List<float[]> gallery; // Slot 0 = değişmez anchor, 1..11 = temiz çoklu açı/ışık hafızası
         public float[] template;
         public long lastSeen;
         public long lastUpdate;
         public int recoverStreak;
+        public int memoryCount;
         public boolean isOccluded;
         public boolean lost;
     }
@@ -79,7 +84,7 @@ public class PersonDetectorEngine {
     private static class RememberedPerson {
         int id;
         long lastSeen;
-        final List<float[]> gallery = new ArrayList<>(4);
+        final List<float[]> gallery = new ArrayList<>(6);
     }
 
     public static class AnalysisOutput {
@@ -99,6 +104,7 @@ public class PersonDetectorEngine {
     private final List<TrackedPerson> prevTracks = new ArrayList<>();
     private final List<RememberedPerson> roomMemory = new ArrayList<>();
     private int nextTrackId = 1;
+    private TrackedPerson pendingRecoveryCandidate = null;
     private LockedState lockedTarget = null;
     private int frameCounter = 0;
 
@@ -340,12 +346,13 @@ public class PersonDetectorEngine {
                 long now = System.currentTimeMillis();
 
                 // 3. Kilitli hedef takibi + Hafıza Bankasına göre kimlik doğrulama
+                pendingRecoveryCandidate = null;
                 if (lockedTarget != null) {
                     updateLockedTargetLocked(candidates, now, out);
                     out.locked = copyLockedState(lockedTarget);
                 }
 
-                // 4. Tüm kişilere kimlik ve 90 sn oda hafızası ile kararlı ID ata
+                // 4. Tüm kişilere kimlik ve 5 dk oda hafızası ile kararlı ID ata
                 assignStableIdsWithMemoryLocked(candidates, now);
                 out.persons = candidates;
             }
@@ -445,6 +452,15 @@ public class PersonDetectorEngine {
                 t.lost = false;
 
                 lockedTarget = t;
+                // Daha önce oda hafızasında varsa mevcut açı örneklerini birleştir
+                for (RememberedPerson mem : roomMemory) {
+                    if (mem.id == t.id) {
+                        for (float[] g : mem.gallery) {
+                            if (t.gallery.size() < MAX_LOCKED_GALLERY) t.gallery.add(g.clone());
+                        }
+                        break;
+                    }
+                }
                 if (outLocked != null) {
                     copyInto(t, outLocked);
                 }
@@ -455,7 +471,14 @@ public class PersonDetectorEngine {
 
     public void unlock() {
         synchronized (stateLock) {
+            if (lockedTarget != null && lockedTarget.gallery != null) {
+                long now = System.currentTimeMillis();
+                for (float[] g : lockedTarget.gallery) {
+                    updateRoomMemoryLocked(lockedTarget.id, g, now);
+                }
+            }
             lockedTarget = null;
+            pendingRecoveryCandidate = null;
         }
     }
 
@@ -583,40 +606,45 @@ public class PersonDetectorEngine {
         List<TrackedPerson> needMemoryMatch = new ArrayList<>();
         List<Integer> usedIds = new ArrayList<>();
 
-        // Kilitli hedef zaten belirlendiyse o ID'yi rezerve et (aynı karede iki kişiye aynı ID verilmesin)
-        if (lockedTarget != null && !lockedTarget.lost) {
-            for (TrackedPerson c : current) {
-                if (computeIoU(c.nx, c.ny, c.nw, c.nh, lockedTarget.nx, lockedTarget.ny, lockedTarget.nw, lockedTarget.nh) > 0.55f) {
-                    c.id = lockedTarget.id;
-                    usedIds.add(c.id);
-                    break;
+        // Kilitli hedef zaten belirlendiyse (veya geri yakalama onaylanıyorsa) o ID'yi rezerve et
+        if (lockedTarget != null) {
+            if (!lockedTarget.lost) {
+                for (TrackedPerson c : current) {
+                    if (computeIoU(c.nx, c.ny, c.nw, c.nh, lockedTarget.nx, lockedTarget.ny, lockedTarget.nw, lockedTarget.nh) > 0.55f) {
+                        c.id = lockedTarget.id;
+                        usedIds.add(c.id);
+                        break;
+                    }
                 }
+            } else if (pendingRecoveryCandidate != null) {
+                pendingRecoveryCandidate.id = lockedTarget.id;
+                usedIds.add(lockedTarget.id);
             }
         }
 
-        // 1. Aşama: Önceki karedeki aktif kişilerle KONUM + GÖRSEL İMZA eşleştirmesi (karışmayı önler)
+        // 1. Aşama: Önceki karedeki aktif kişilerle KONUM + ÇOK-İPUCULU RE-ID eşleştirmesi (karışmayı önler)
         for (TrackedPerson cur : current) {
             if (cur.id > 0) continue;
 
             TrackedPerson bestPrev = null;
-            float bestScore = 0.40f;
+            float bestScore = 0.42f;
+            boolean legsCropped = (cur.ny + cur.nh > 0.94f);
             for (TrackedPerson prev : unmatchedPrev) {
                 if (usedIds.contains(prev.id)) continue;
                 float iou = computeIoU(cur.nx, cur.ny, cur.nw, cur.nh, prev.nx, prev.ny, prev.nw, prev.nh);
                 float dist = (float) Math.hypot(cur.centerX() - prev.centerX(), cur.centerY() - prev.centerY());
-                float posScore = iou * 1.4f + Math.max(0f, 0.35f - dist) * 2.2f;
+                float posScore = iou * 1.4f + Math.max(0f, 0.35f - dist) * 2.0f;
 
                 float appScore = 0.65f;
                 float torso = 0.65f;
                 if (cur.signature != null && prev.signature != null) {
-                    appScore = sigSim(cur.signature, prev.signature);
+                    appScore = reidSim(cur.signature, prev.signature, legsCropped);
                     torso = zoneSim(cur.signature, prev.signature, 1);
-                    // Çoklu kişi ortamında gövde rengi tamamen uyuşmuyorsa yakın diye karıştırma!
-                    if ((prevTracks.size() > 1 || current.size() > 1) && (appScore < 0.54f || torso < 0.48f)) {
+                    if ((prevTracks.size() > 1 || current.size() > 1) && (appScore < 0.56f || torso < 0.48f)) {
                         continue;
                     }
                 }
-                float total = posScore + appScore * 2.4f + torso * 1.0f;
+                float total = posScore + appScore * 2.6f + torso * 1.0f;
                 if (total > bestScore) {
                     bestScore = total;
                     bestPrev = prev;
@@ -632,28 +660,20 @@ public class PersonDetectorEngine {
             }
         }
 
-        // 2. Aşama: Kadraja yeniden giren kişileri 90 saniyelik Re-ID hafızasında ara
+        // 2. Aşama: Kadraja yeniden giren kişileri 5 dakikalık çoklu-ipucu Re-ID hafızasında ara
         for (TrackedPerson cur : needMemoryMatch) {
             RememberedPerson bestMem = null;
             float bestSim = 0f;
+            boolean legsCropped = (cur.ny + cur.nh > 0.94f);
 
             if (cur.signature != null) {
                 for (RememberedPerson mem : roomMemory) {
                     if (usedIds.contains(mem.id)) continue;
-                    // Kilitli bir hedef kayıpsa onun ID'sini rastgele birine verme (kilit kurtarma ayrıca doğrular)
                     if (lockedTarget != null && lockedTarget.id == mem.id) continue;
 
-                    float maxG = 0f;
-                    float bestTorso = 0f;
-                    for (float[] gSig : mem.gallery) {
-                        float sim = sigSim(gSig, cur.signature);
-                        if (sim > maxG) {
-                            maxG = sim;
-                            bestTorso = zoneSim(gSig, cur.signature, 1);
-                        }
-                    }
-                    if (maxG >= 0.73f && bestTorso >= 0.67f && maxG > bestSim) {
-                        bestSim = maxG;
+                    GalleryMatch gm = matchGallery(mem.gallery, cur.signature, legsCropped);
+                    if (gm.combined >= 0.70f && gm.torso >= 0.60f && gm.combined > bestSim) {
+                        bestSim = gm.combined;
                         bestMem = mem;
                     }
                 }
@@ -672,10 +692,12 @@ public class PersonDetectorEngine {
             }
         }
 
-        // 3. Aşama: Hafızayı temiz çoklu açı örnekleriyle güncelle (kalabalık çakışma anında güncelleme!)
+        // 3. Aşama: Hafızayı temiz, kenardan kesilmemiş çoklu açı örnekleriyle güncelle
         for (TrackedPerson cur : current) {
             cur.lastSeen = now;
-            if (cur.signature == null) continue;
+            if (cur.signature == null || cur == pendingRecoveryCandidate) continue;
+            if (isEdgeClipped(cur.nx, cur.ny, cur.nw, cur.nh)) continue;
+
             boolean crowded = false;
             for (TrackedPerson other : current) {
                 if (other != cur && computeIoU(cur.nx, cur.ny, cur.nw, cur.nh, other.nx, other.ny, other.nw, other.nh) > 0.14f) {
@@ -715,11 +737,11 @@ public class PersonDetectorEngine {
         } else {
             float bestSim = 0f;
             for (float[] g : target.gallery) {
-                bestSim = Math.max(bestSim, sigSim(g, sig));
+                bestSim = Math.max(bestSim, reidSim(g, sig, false));
             }
             if (bestSim < 0.89f) {
-                if (target.gallery.size() >= 4) {
-                    target.gallery.remove(1); // Slot 0 temel referansı koru
+                if (target.gallery.size() >= 6) {
+                    target.gallery.remove(1);
                 }
                 target.gallery.add(sig.clone());
             }
@@ -753,46 +775,36 @@ public class PersonDetectorEngine {
             float sizeRatio = Math.min(dArea / Math.max(1e-6f, t.baseArea), t.baseArea / Math.max(1e-6f, dArea));
             float dAspect = d.nw / Math.max(0.01f, d.nh);
             float aspectSim = Math.min(dAspect / Math.max(0.01f, t.aspectRatio), t.aspectRatio / Math.max(0.01f, dAspect));
+            boolean legsCropped = (d.ny + d.nh > 0.94f);
 
-            // Çoklu-Açı Hafıza Bankasındaki (slot 0..7) tüm görünümlerle kıyasla
-            float maxGallerySim = 0f;
-            float correspondingTorso = 0f;
-            if (t.gallery != null && !t.gallery.isEmpty()) {
-                for (float[] gSig : t.gallery) {
-                    float s = sigSim(gSig, d.signature);
-                    if (s > maxGallerySim) {
-                        maxGallerySim = s;
-                        correspondingTorso = zoneSim(gSig, d.signature, 1);
-                    }
-                }
-            }
-            float anchorSim = (t.anchorSig != null) ? sigSim(t.anchorSig, d.signature) : maxGallerySim;
-            float anchorTorso = (t.anchorSig != null) ? zoneSim(t.anchorSig, d.signature, 1) : correspondingTorso;
+            // Çoklu-Açı/Işık Hafıza Bankasındaki tüm görünümlerle (En yüksek + ilk 2 ortalama) kıyasla
+            GalleryMatch gm = matchGallery(t.gallery, d.signature, legsCropped);
+            float anchorSim = (t.anchorSig != null) ? reidSim(t.anchorSig, d.signature, legsCropped) : gm.combined;
+            float anchorTorso = (t.anchorSig != null) ? zoneSim(t.anchorSig, d.signature, 1) : gm.torso;
 
             float score;
             if (!t.lost) {
-                // Aktif takipte dahi gövde/görünüm eşiği zorunlu — yanından geçen başka insana KİLİT ATLAMAZ
-                if (maxGallerySim < 0.56f || Math.max(correspondingTorso, anchorTorso) < 0.50f) continue;
-                if (sizeRatio < 0.20f) continue;
-                score = maxGallerySim * 3.8f + correspondingTorso * 1.6f + iou * 1.6f
-                        + aspectSim * 0.5f - (dist / Math.max(0.05f, diag)) * 0.45f + sizeRatio * 0.4f;
+                if (gm.combined < 0.54f || Math.max(gm.torso, anchorTorso) < 0.48f) continue;
+                if (sizeRatio < 0.16f) continue;
+                score = gm.combined * 4.0f + gm.torso * 1.5f + iou * 1.5f
+                        + aspectSim * 0.45f - (dist / Math.max(0.05f, diag)) * 0.45f + sizeRatio * 0.35f;
             } else {
-                // Kişi kameradan çıkıp tekrar girdiğinde Re-ID geri yakalama (uzaklık farkı esnek: sizeRatio >= 0.10)
-                if (maxGallerySim < 0.72f || correspondingTorso < 0.66f) continue;
-                if (sizeRatio < 0.10f || aspectSim < 0.35f) continue;
-                score = maxGallerySim * 4.2f + correspondingTorso * 2.0f + anchorSim * 1.2f + sizeRatio * 0.4f;
+                // Çıkıp giren kişiyi ışık/konum/yakınlık değişiminde dahi yüksek doğrulukla geri yakala
+                if (gm.combined < 0.68f || gm.torso < 0.58f) continue;
+                if (sizeRatio < 0.08f || (!legsCropped && aspectSim < 0.30f)) continue;
+                score = gm.combined * 4.5f + gm.torso * 1.8f + anchorSim * 1.0f + sizeRatio * 0.3f;
             }
 
             if (score > bestScore) {
                 bestScore = score;
                 best = d;
                 bestIoU = iou;
-                bestGallerySimMatched = maxGallerySim;
+                bestGallerySimMatched = gm.combined;
                 bestAnchorSimMatched = anchorSim;
             }
         }
 
-        // Çakışma (occlusion) kontrolü: iki kişi üst üste ise şablon ve hafıza güncellemesini dondur
+        // Çakışma (occlusion) kontrolü
         boolean conflicted = false;
         if (best != null) {
             for (TrackedPerson other : detections) {
@@ -804,11 +816,12 @@ public class PersonDetectorEngine {
         }
         t.isOccluded = conflicted;
 
-        // Kayıpken kişi geri göründüyse 2 kare (veya >=0.80 yüksek eşleşme) ile doğrula ve alarmı kapat
+        // Kayıpken kişi geri göründüyse 2 kare (veya >=0.77 çok-ipucu eşleşmesi) ile anında yakala
         if (t.lost) {
             if (best != null) {
+                pendingRecoveryCandidate = best;
                 t.recoverStreak++;
-                if (t.recoverStreak >= 2 || bestGallerySimMatched >= 0.80f) {
+                if (t.recoverStreak >= 2 || bestGallerySimMatched >= 0.77f) {
                     t.lost = false;
                     t.recoverStreak = 0;
                     t.vx = 0f;
@@ -822,7 +835,7 @@ public class PersonDetectorEngine {
             return;
         }
 
-        // Aktif takipte AI bulduysa güncelle ve çoklu açı hafızasını besle
+        // Aktif takipte AI bulduysa güncelle ve çoklu açı/ışık hafızasını besle
         if (best != null) {
             applyMatchedPosition(t, best, now, conflicted, bestIoU, bestGallerySimMatched, bestAnchorSimMatched);
             return;
@@ -841,8 +854,6 @@ public class PersonDetectorEngine {
             t.ny = Math.max(-0.12f, Math.min(0.95f, predY));
             t.lastUpdate = now;
         } else if (now - t.lastSeen >= TARGET_LOST_TIMEOUT_MS) {
-            // 1.1 saniye boyunca hem AI hem şablon doğrulayamadı -> HEDEF KAYIP, ALARM ÇAL!
-            // Hafıza bankası (t.gallery ve anchorSig) korunur; kişi geri geldiğinde otomatik tanır!
             t.lost = true;
             t.recoverStreak = 0;
             out.targetJustLost = true;
@@ -870,13 +881,15 @@ public class PersonDetectorEngine {
         t.lastSeen = now;
         t.lastUpdate = now;
 
-        // Sadece çakışma yoksa ve orijinal anchor ile güçlü bağ korunuyorsa hafızayı çeşitlendir
-        if (!conflicted && best.signature != null && best.score >= 0.36f && bestIoU > 0.30f && anchorSim >= 0.62f) {
+        // Kenardan kesilmemiş, çakışmasız ve anchor'a bağlı temiz görünümleri çoklu hafızaya ekle
+        if (!conflicted && best.signature != null && best.score >= 0.34f
+                && !isEdgeClipped(best.nx, best.ny, best.nw, best.nh)
+                && (bestIoU > 0.28f || t.lost) && anchorSim >= 0.58f) {
             if (t.gallery == null) t.gallery = new ArrayList<>(MAX_LOCKED_GALLERY);
             if (t.gallery.isEmpty() && t.anchorSig != null) t.gallery.add(t.anchorSig.clone());
-            if (maxGallerySim < 0.90f) {
+            if (maxGallerySim < 0.89f) {
                 if (t.gallery.size() >= MAX_LOCKED_GALLERY) {
-                    t.gallery.remove(1); // Slot 0 değişmez anchor!
+                    t.gallery.remove(1);
                 }
                 t.gallery.add(best.signature.clone());
             }
@@ -885,29 +898,61 @@ public class PersonDetectorEngine {
         }
     }
 
-    // =================== 3-BÖLGELİ MERKEZ AĞIRLIKLI RE-ID İMZASI & NCC PİKSEL ŞABLONU ===================
+    private boolean isEdgeClipped(float nx, float ny, float nw, float nh) {
+        return nx < 0.02f || (nx + nw) > 0.98f || ny < 0.02f || (ny + nh) > 0.98f;
+    }
+
+    private static class GalleryMatch {
+        float combined;
+        float torso;
+    }
+
+    private GalleryMatch matchGallery(List<float[]> gallery, float[] candSig, boolean legsCropped) {
+        GalleryMatch gm = new GalleryMatch();
+        if (gallery == null || gallery.isEmpty() || candSig == null) return gm;
+
+        float best1 = 0f, best2 = 0f;
+        float bestTorso = 0f;
+        for (float[] g : gallery) {
+            float s = reidSim(g, candSig, legsCropped);
+            if (s > best1) {
+                best2 = best1;
+                best1 = s;
+                bestTorso = zoneSim(g, candSig, 1);
+            } else if (s > best2) {
+                best2 = s;
+            }
+        }
+        gm.combined = (gallery.size() > 1 && best2 > 0f) ? (best1 * 0.65f + best2 * 0.35f) : best1;
+        gm.torso = bestTorso;
+        return gm;
+    }
+
+    // =================== YUMUŞAK DAĞILIMLI 3-BÖLGELİ RE-ID + CHROMA + YAPISAL DESEN ===================
     private float[] computeSignature(int[] pixels, float nx, float ny, float nw, float nh) {
         int x0 = Math.max(0, (int) Math.floor((nx + nw * 0.16f) * ANA_W));
         int x1 = Math.min(ANA_W, (int) Math.ceil((nx + nw * 0.84f) * ANA_W));
         int yHead0 = Math.max(0, (int) Math.floor((ny + nh * 0.04f) * ANA_H));
         int yHead1 = Math.min(ANA_H, Math.max(yHead0 + 1, (int) Math.floor((ny + nh * 0.25f) * ANA_H)));
-        int yTorso1 = Math.min(ANA_H, Math.max(yHead1 + 1, (int) Math.floor((ny + nh * 0.56f) * ANA_H)));
-        int yLegs1 = Math.min(ANA_H, Math.max(yTorso1 + 1, (int) Math.ceil((ny + nh * 0.92f) * ANA_H)));
+        int yTorso1 = Math.min(ANA_H, Math.max(yHead1 + 1, (int) Math.floor((ny + nh * 0.57f) * ANA_H)));
+        int yLegs1 = Math.min(ANA_H, Math.max(yTorso1 + 1, (int) Math.ceil((ny + nh * 0.90f) * ANA_H)));
         if (x1 - x0 < 2 || yLegs1 - yHead0 < 6) return null;
 
         float centerX = (x0 + x1) * 0.5f;
         float halfW = Math.max(1f, (x1 - x0) * 0.5f);
         float[] sig = new float[SIG_LEN];
-        accumulateZoneHist(pixels, x0, yHead0, x1, yHead1, centerX, halfW, sig, 0);
-        accumulateZoneHist(pixels, x0, yHead1, x1, yTorso1, centerX, halfW, sig, ZONE_LEN);
-        accumulateZoneHist(pixels, x0, yTorso1, x1, yLegs1, centerX, halfW, sig, ZONE_LEN * 2);
+        accumulateZoneHistAndChroma(pixels, x0, yHead0, x1, yHead1, centerX, halfW, sig, 0, HIST_TOTAL);
+        accumulateZoneHistAndChroma(pixels, x0, yHead1, x1, yTorso1, centerX, halfW, sig, ZONE_LEN, HIST_TOTAL + 3);
+        accumulateZoneHistAndChroma(pixels, x0, yTorso1, x1, yLegs1, centerX, halfW, sig, ZONE_LEN * 2, HIST_TOTAL + 6);
+        extractStructuralPatch(pixels, nx + nw * 0.18f, ny + nh * 0.06f, nw * 0.64f, nh * 0.82f, sig, HIST_TOTAL + CHROMA_LEN);
         return sig;
     }
 
-    private void accumulateZoneHist(
+    private void accumulateZoneHistAndChroma(
             int[] pixels, int x0, int y0, int x1, int y1,
-            float cx, float halfW, float[] out, int offset) {
+            float cx, float halfW, float[] out, int histOffset, int chromaOffset) {
         float wSum = 0f;
+        float rgAcc = 0f, ybAcc = 0f, lumAcc = 0f;
         for (int py = y0; py < y1; py++) {
             int row = py * ANA_W;
             for (int px = x0; px < x1; px++) {
@@ -921,14 +966,23 @@ public class PersonDetectorEngine {
                 float v = max / 255f;
                 float s = (max == 0) ? 0f : (float) (max - min) / max;
 
-                // Merkez ağırlıklı pencere: kenarlardaki arka plan duvar/eşyayı bastırır
                 float ndx = (px + 0.5f - cx) / halfW;
                 float weight = Math.max(0.25f, 1.0f - 0.65f * ndx * ndx);
 
-                int bin;
+                // Aydınlatmadan bağımsız normalize rakip renk kanalları (RG, YB)
+                float denom = r + g + b + 32f;
+                rgAcc += ((r - g) / denom) * weight;
+                ybAcc += ((r + g - 2f * b) / (2f * denom)) * weight;
+                lumAcc += ((0.299f * r + 0.587f * g + 0.114f * b) / 255f) * weight;
+
+                // Komşu binlere yumuşak üçgensel dağıtım (ışık/WB kaymasında sert düşüşü önler)
                 if (s < 0.16f || v < 0.12f) {
                     int gb = Math.min(GRAY_BINS - 1, (int) Math.floor(v * GRAY_BINS));
-                    bin = HUE_BINS * SAT_BINS + gb;
+                    int gbL = Math.max(0, gb - 1);
+                    int gbR = Math.min(GRAY_BINS - 1, gb + 1);
+                    out[histOffset + HUE_BINS + gb] += weight * 0.60f;
+                    out[histOffset + HUE_BINS + gbL] += weight * 0.20f;
+                    out[histOffset + HUE_BINS + gbR] += weight * 0.20f;
                 } else {
                     float d = max - min;
                     float hue;
@@ -937,17 +991,49 @@ public class PersonDetectorEngine {
                     else hue = (r - g) / d + 4f;
                     hue = (hue * 60f + 360f) % 360f;
                     int hb = ((int) Math.floor(hue / 360f * HUE_BINS)) % HUE_BINS;
-                    int sb = Math.min(SAT_BINS - 1, (int) Math.floor((s - 0.16f) / 0.84f * SAT_BINS));
-                    bin = hb * SAT_BINS + sb;
+                    int hbL = (hb + HUE_BINS - 1) % HUE_BINS;
+                    int hbR = (hb + 1) % HUE_BINS;
+                    out[histOffset + hb] += weight * 0.58f;
+                    out[histOffset + hbL] += weight * 0.21f;
+                    out[histOffset + hbR] += weight * 0.21f;
                 }
-                out[offset + bin] += weight;
                 wSum += weight;
             }
         }
         if (wSum > 0f) {
             for (int i = 0; i < ZONE_LEN; i++) {
-                out[offset + i] /= wSum;
+                out[histOffset + i] /= wSum;
             }
+            out[chromaOffset] = rgAcc / wSum;
+            out[chromaOffset + 1] = ybAcc / wSum;
+            out[chromaOffset + 2] = lumAcc / wSum;
+        }
+    }
+
+    private void extractStructuralPatch(int[] pixels, float nx, float ny, float nw, float nh, float[] out, int offset) {
+        if (nw <= 0.005f || nh <= 0.01f) return;
+        float sum = 0f;
+        for (int py = 0; py < PATCH_H; py++) {
+            int yIdx = Math.min(ANA_H - 1, Math.max(0, (int) Math.floor((ny + (py + 0.5f) / PATCH_H * nh) * ANA_H)));
+            int row = yIdx * ANA_W;
+            for (int px = 0; px < PATCH_W; px++) {
+                int xIdx = Math.min(ANA_W - 1, Math.max(0, (int) Math.floor((nx + (px + 0.5f) / PATCH_W * nw) * ANA_W)));
+                int argb = pixels[row + xIdx];
+                float lum = 0.299f * ((argb >> 16) & 0xFF) + 0.587f * ((argb >> 8) & 0xFF) + 0.114f * (argb & 0xFF);
+                out[offset + py * PATCH_W + px] = lum;
+                sum += lum;
+            }
+        }
+        float mean = sum / PATCH_LEN;
+        float normSq = 0f;
+        for (int i = 0; i < PATCH_LEN; i++) {
+            out[offset + i] -= mean;
+            normSq += out[offset + i] * out[offset + i];
+        }
+        float norm = (float) Math.sqrt(normSq);
+        if (norm < 1e-3f) norm = 1f;
+        for (int i = 0; i < PATCH_LEN; i++) {
+            out[offset + i] /= norm;
         }
     }
 
@@ -960,11 +1046,44 @@ public class PersonDetectorEngine {
         return s;
     }
 
-    private float sigSim(float[] a, float[] b) {
+    private float reidSim(float[] a, float[] b, boolean legsCropped) {
         float head = zoneSim(a, b, 0);
         float torso = zoneSim(a, b, 1);
-        float legs = zoneSim(a, b, 2);
-        return head * 0.22f + torso * 0.50f + legs * 0.28f;
+        float colorSim;
+        if (legsCropped) {
+            colorSim = head * 0.30f + torso * 0.70f;
+        } else {
+            float legs = zoneSim(a, b, 2);
+            colorSim = head * 0.20f + torso * 0.52f + legs * 0.28f;
+        }
+
+        // Normalize rakip renk + üst-alt gövde parlaklık kontrast uyumu (ışık değişiminden etkilenmez)
+        float rg1A = a[HIST_TOTAL + 3], yb1A = a[HIST_TOTAL + 4];
+        float rg1B = b[HIST_TOTAL + 3], yb1B = b[HIST_TOTAL + 4];
+        float torsoChromaDist = Math.abs(rg1A - rg1B) + Math.abs(yb1A - yb1B);
+        float torsoChromaSim = (float) Math.exp(-3.4f * torsoChromaDist);
+
+        float contrastSim;
+        if (legsCropped) {
+            float dHeadA = a[HIST_TOTAL + 2] - a[HIST_TOTAL + 5];
+            float dHeadB = b[HIST_TOTAL + 2] - b[HIST_TOTAL + 5];
+            contrastSim = (float) Math.exp(-2.8f * Math.abs(dHeadA - dHeadB));
+        } else {
+            float dLegA = a[HIST_TOTAL + 5] - a[HIST_TOTAL + 8];
+            float dLegB = b[HIST_TOTAL + 5] - b[HIST_TOTAL + 8];
+            contrastSim = (float) Math.exp(-2.8f * Math.abs(dLegA - dLegB));
+        }
+        float chromaSim = torsoChromaSim * 0.65f + contrastSim * 0.35f;
+
+        // 6x10 yapısal vücut silüet/desen benzerliği
+        int pOff = HIST_TOTAL + CHROMA_LEN;
+        float dot = 0f;
+        for (int i = 0; i < PATCH_LEN; i++) {
+            dot += a[pOff + i] * b[pOff + i];
+        }
+        float patchSim = Math.max(0f, Math.min(1f, 0.25f + 0.75f * dot));
+
+        return colorSim * 0.52f + chromaSim * 0.26f + patchSim * 0.22f;
     }
 
     private float[] extractTemplate(int[] pixels, float nx, float ny, float nw, float nh) {
@@ -1060,6 +1179,7 @@ public class PersonDetectorEngine {
         dst.lastSeen = src.lastSeen;
         dst.lastUpdate = src.lastUpdate;
         dst.recoverStreak = src.recoverStreak;
+        dst.memoryCount = (src.gallery != null) ? src.gallery.size() : src.memoryCount;
         dst.isOccluded = src.isOccluded;
         dst.lost = src.lost;
     }
