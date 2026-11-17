@@ -1,0 +1,12 @@
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+-keep class com.cam.ai.** { *; }
+-keep class com.google.mediapipe.** { *; }
+-keep class com.google.common.flogger.** { *; }
+-keep class com.google.protobuf.** { *; }
+-keep class androidx.camera.** { *; }
+-keep class fi.iki.elonen.** { *; }
+-dontwarn com.google.mediapipe.proto.**
+-dontwarn org.slf4j.**
+-dontwarn javax.annotation.**
+-dontwarn java.lang.invoke.**
+-dontwarn com.google.errorprone.annotations.**

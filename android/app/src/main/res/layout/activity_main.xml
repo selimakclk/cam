@@ -1,0 +1,594 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <!-- 1. KAMERA EKRANI (CAMERAX + TFLITE AI + VİZÖR) -->
+    <FrameLayout
+        android:id="@+id/cameraContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone">
+
+        <androidx.camera.view.PreviewView
+            android:id="@+id/previewView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            app:scaleType="fillCenter" />
+
+        <com.cam.ai.OverlayView
+            android:id="@+id/overlayView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <!-- ÜST DURUM & HEDEF HUD -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingHorizontal="14dp"
+            android:paddingTop="36dp">
+
+            <!-- Üst Bar -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_capsule"
+                android:gravity="center_vertical"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="9dp">
+
+                <View
+                    android:id="@+id/statusDot"
+                    android:layout_width="8dp"
+                    android:layout_height="8dp"
+                    android:background="@drawable/dot_active" />
+
+                <TextView
+                    android:id="@+id/txtStatus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="AI Başlatılıyor..."
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/txtIpBadge"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Şifre: •••••"
+                    android:textColor="#AEAEB2"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <!-- Hedef Kilidi Kapsülü -->
+            <LinearLayout
+                android:id="@+id/targetBanner"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_capsule"
+                android:gravity="center_vertical"
+                android:paddingHorizontal="16dp"
+                android:paddingVertical="7dp">
+
+                <TextView
+                    android:id="@+id/txtTargetStatus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Kişiye dokunarak kilitleyin"
+                    android:textColor="#FFFFFF"
+                    android:textSize="13sp"
+                    android:textStyle="bold" />
+
+                <androidx.appcompat.widget.AppCompatButton
+                    android:id="@+id/btnUnlock"
+                    android:layout_width="wrap_content"
+                    android:layout_height="30dp"
+                    android:layout_marginStart="10dp"
+                    android:background="@drawable/btn_danger"
+                    android:minWidth="0dp"
+                    android:paddingHorizontal="12dp"
+                    android:text="Kilidi Aç"
+                    android:textAllCaps="false"
+                    android:textColor="#FFFFFF"
+                    android:textSize="11sp"
+                    android:textStyle="bold"
+                    android:visibility="gone" />
+            </LinearLayout>
+
+            <!-- Anlık Uyarı Hapı (Boş yere dokununca çıkar) -->
+            <TextView
+                android:id="@+id/txtWarningBanner"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_capsule"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="6dp"
+                android:text="Kişi seçilmedi — Bir insana dokunun"
+                android:textColor="#FFD60A"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- ALT KONTROL PANELİ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:orientation="vertical"
+            android:paddingHorizontal="14dp"
+            android:paddingBottom="20dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card"
+                android:orientation="vertical"
+                android:padding="14dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <TextView
+                        android:id="@+id/txtCodeDisplay"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="Oda: 12345  •  IP: -"
+                        android:textColor="#AEAEB2"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/txtFpsDisplay"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="AI Hazır"
+                        android:textColor="#30D158"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="10dp"
+                    android:orientation="horizontal">
+
+                    <androidx.appcompat.widget.AppCompatButton
+                        android:id="@+id/btnStealth"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_marginEnd="5dp"
+                        android:layout_weight="1.2"
+                        android:background="@drawable/btn_secondary"
+                        android:text="Ekranı Karart"
+                        android:textAllCaps="false"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <androidx.appcompat.widget.AppCompatButton
+                        android:id="@+id/btnTorch"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_marginHorizontal="5dp"
+                        android:layout_weight="0.8"
+                        android:background="@drawable/btn_secondary"
+                        android:text="Flaş"
+                        android:textAllCaps="false"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <androidx.appcompat.widget.AppCompatButton
+                        android:id="@+id/btnFlip"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_marginHorizontal="5dp"
+                        android:layout_weight="0.8"
+                        android:background="@drawable/btn_secondary"
+                        android:text="Çevir"
+                        android:textAllCaps="false"
+                        android:textColor="#FFFFFF"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <androidx.appcompat.widget.AppCompatButton
+                        android:id="@+id/btnBackMain"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_marginStart="5dp"
+                        android:layout_weight="0.8"
+                        android:background="@drawable/btn_secondary"
+                        android:text="Çıkış"
+                        android:textAllCaps="false"
+                        android:textColor="#FF453A"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- 2. İZLEYİCİ EKRANI (CANLI YAYIN + SENKRON VİZÖR + UZAKTAN KONTROL) -->
+    <FrameLayout
+        android:id="@+id/viewerContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:visibility="gone">
+
+        <ImageView
+            android:id="@+id/viewerStream"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="fitCenter" />
+
+        <com.cam.ai.OverlayView
+            android:id="@+id/viewerOverlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <!-- İzleyici Üst Bar -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingHorizontal="14dp"
+            android:paddingTop="36dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_capsule"
+                android:gravity="center_vertical"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="9dp">
+
+                <View
+                    android:id="@+id/viewerStatusDot"
+                    android:layout_width="8dp"
+                    android:layout_height="8dp"
+                    android:background="@drawable/dot_active" />
+
+                <TextView
+                    android:id="@+id/txtViewerStatus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="Kamera Aranıyor..."
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <androidx.appcompat.widget.AppCompatButton
+                    android:id="@+id/btnViewerManualIp"
+                    android:layout_width="wrap_content"
+                    android:layout_height="28dp"
+                    android:layout_marginEnd="6dp"
+                    android:background="@drawable/btn_pill"
+                    android:minWidth="0dp"
+                    android:paddingHorizontal="10dp"
+                    android:text="IP Gir"
+                    android:textAllCaps="false"
+                    android:textColor="#FFFFFF"
+                    android:textSize="11sp" />
+
+                <androidx.appcompat.widget.AppCompatButton
+                    android:id="@+id/btnViewerDisconnect"
+                    android:layout_width="wrap_content"
+                    android:layout_height="28dp"
+                    android:background="@drawable/btn_danger"
+                    android:minWidth="0dp"
+                    android:paddingHorizontal="10dp"
+                    android:text="Ayrıl"
+                    android:textAllCaps="false"
+                    android:textColor="#FFFFFF"
+                    android:textSize="11sp" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_capsule"
+                android:gravity="center_vertical"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="7dp">
+
+                <TextView
+                    android:id="@+id/txtViewerTarget"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Kişiye dokunarak kilitleyin"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <androidx.appcompat.widget.AppCompatButton
+                    android:id="@+id/btnViewerUnlock"
+                    android:layout_width="wrap_content"
+                    android:layout_height="28dp"
+                    android:layout_marginStart="10dp"
+                    android:background="@drawable/btn_danger"
+                    android:minWidth="0dp"
+                    android:paddingHorizontal="10dp"
+                    android:text="Kilidi Aç"
+                    android:textAllCaps="false"
+                    android:textColor="#FFFFFF"
+                    android:textSize="11sp"
+                    android:visibility="gone" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- İzleyici Alt Uzaktan Kontroller -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom"
+            android:paddingHorizontal="14dp"
+            android:paddingBottom="20dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:background="@drawable/bg_card"
+                android:orientation="horizontal"
+                android:padding="10dp">
+
+                <androidx.appcompat.widget.AppCompatButton
+                    android:id="@+id/btnViewerTorch"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_secondary"
+                    android:text="Kameranın Flaşını Aç/Kapat"
+                    android:textAllCaps="false"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <androidx.appcompat.widget.AppCompatButton
+                    android:id="@+id/btnViewerFlip"
+                    android:layout_width="0dp"
+                    android:layout_height="44dp"
+                    android:layout_marginStart="6dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/btn_secondary"
+                    android:text="Kamerayı Çevir"
+                    android:textAllCaps="false"
+                    android:textColor="#FFFFFF"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- 3. ANA GİRİŞ MENÜSÜ -->
+    <LinearLayout
+        android:id="@+id/roleContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_card"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="26dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:letterSpacing="-0.03"
+                android:text="CAM AI"
+                android:textColor="#FFFFFF"
+                android:textSize="32sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:layout_marginBottom="22dp"
+                android:text="Güvenlik Kamerası &amp; Yapay Zeka Takip"
+                android:textColor="#8E8E93"
+                android:textSize="13sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="6dp"
+                android:text="5 Haneli Bağlantı Şifresi"
+                android:textColor="#AEAEB2"
+                android:textSize="12sp" />
+
+            <EditText
+                android:id="@+id/editPassword"
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:background="@drawable/input_field"
+                android:gravity="center"
+                android:hint="Örn: 12345"
+                android:inputType="number"
+                android:letterSpacing="0.25"
+                android:maxLength="5"
+                android:text="12345"
+                android:textColor="#FFFFFF"
+                android:textColorHint="#48484A"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <androidx.appcompat.widget.AppCompatButton
+                android:id="@+id/btnRoleCamera"
+                android:layout_width="match_parent"
+                android:layout_height="54dp"
+                android:layout_marginTop="18dp"
+                android:background="@drawable/btn_primary"
+                android:text="Kamera Ol (AI Başlat)"
+                android:textAllCaps="false"
+                android:textColor="#000000"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <androidx.appcompat.widget.AppCompatButton
+                android:id="@+id/btnRoleViewer"
+                android:layout_width="match_parent"
+                android:layout_height="54dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_secondary"
+                android:text="İzleyici Ol (Bağlan)"
+                android:textAllCaps="false"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:gravity="center"
+                android:text="Gizli mod PIN kodu: 7693 • %100 Çevrimdışı Cihaz İçi AI"
+                android:textColor="#636366"
+                android:textSize="11sp" />
+
+            <androidx.appcompat.widget.AppCompatButton
+                android:id="@+id/btnCheckUpdate"
+                android:layout_width="match_parent"
+                android:layout_height="38dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/btn_pill"
+                android:text="Sürüm v2.0 • Güncellemeyi Kontrol Et"
+                android:textAllCaps="false"
+                android:textColor="#AEAEB2"
+                android:textSize="12sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- 4. GİZLİ MOD (SAF OLED SİYAH + ÖZEL PIN PAD) -->
+    <FrameLayout
+        android:id="@+id/stealthScreen"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#000000"
+        android:clickable="true"
+        android:focusable="true"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/stealthPinPanel"
+            android:layout_width="300dp"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:background="@drawable/bg_card"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="20dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Gizli Mod Kilidi"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/txtPinDots"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginVertical="12dp"
+                android:letterSpacing="0.3"
+                android:text="○ ○ ○ ○"
+                android:textColor="#FFFFFF"
+                android:textSize="22sp" />
+
+            <GridLayout
+                android:id="@+id/pinKeypad"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:columnCount="3"
+                android:useDefaultMargins="true">
+
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin1" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="1" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin2" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="2" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin3" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="3" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin4" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="4" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin5" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="5" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin6" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="6" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin7" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="7" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin8" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="8" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin9" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="9" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pinCancel" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="Kapat" android:textAllCaps="false" android:textColor="#8E8E93" android:textSize="13sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pin0" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="0" android:textColor="#FFFFFF" android:textSize="18sp" />
+                <androidx.appcompat.widget.AppCompatButton android:id="@+id/pinDel" android:layout_width="0dp" android:layout_height="48dp" android:layout_columnWeight="1" android:background="@drawable/btn_secondary" android:text="⌫" android:textColor="#FF453A" android:textSize="16sp" />
+            </GridLayout>
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- 5. ACİL ALARM PENCERESİ -->
+    <LinearLayout
+        android:id="@+id/alarmOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#D9D70015"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="32dp"
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="⚠ HEDEF KAYIP!"
+            android:textColor="#FFFFFF"
+            android:textSize="30sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:layout_marginBottom="28dp"
+            android:gravity="center"
+            android:text="Kilitlenen kişi kadrajdan ayrıldı veya kayboldu."
+            android:textColor="#FFFFFF"
+            android:textSize="15sp" />
+
+        <androidx.appcompat.widget.AppCompatButton
+            android:id="@+id/btnDismissAlarm"
+            android:layout_width="wrap_content"
+            android:layout_height="52dp"
+            android:background="@drawable/btn_primary"
+            android:paddingHorizontal="36dp"
+            android:text="Alarmı Sustur"
+            android:textAllCaps="false"
+            android:textColor="#000000"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+</FrameLayout>
