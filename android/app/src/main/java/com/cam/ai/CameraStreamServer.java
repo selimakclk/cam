@@ -114,11 +114,14 @@ public class CameraStreamServer extends NanoHTTPD {
                 for (TrackedPerson p : persons) {
                     JSONObject o = new JSONObject();
                     o.put("id", p.id);
+                    if (p.name != null && !p.name.trim().isEmpty()) o.put("name", p.name.trim());
                     o.put("x", p.nx);
                     o.put("y", p.ny);
                     o.put("w", p.nw);
                     o.put("h", p.nh);
                     o.put("s", p.score);
+                    o.put("deep", p.hasDeepAi);
+                    o.put("face", p.hasFaceAi);
                     arr.put(o);
                 }
             }
@@ -127,12 +130,16 @@ public class CameraStreamServer extends NanoHTTPD {
             if (locked != null) {
                 JSONObject lo = new JSONObject();
                 lo.put("id", locked.id);
+                if (locked.name != null && !locked.name.trim().isEmpty()) lo.put("name", locked.name.trim());
                 lo.put("x", locked.nx);
                 lo.put("y", locked.ny);
                 lo.put("w", locked.nw);
                 lo.put("h", locked.nh);
                 lo.put("s", locked.score);
                 lo.put("lost", locked.lost);
+                lo.put("deep", locked.hasDeepAi);
+                lo.put("face", locked.hasFaceAi);
+                lo.put("mem", locked.memoryCount);
                 root.put("locked", lo);
             } else {
                 root.put("locked", JSONObject.NULL);

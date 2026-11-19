@@ -1,16 +1,22 @@
 package com.cam.ai;
 
 /**
- * Normalize [0..1] kamera/görüntü koordinatlarında tespit edilen bir insanı temsil eder.
+ * Normalize [0..1] kamera/görüntü koordinatlarında tespit edilen bir insanı
+ * ve çok katmanlı yapay zeka (129-D + Derin Vücut + Biyometrik Yüz) kimlik özelliklerini temsil eder.
  */
 public class TrackedPerson {
     public int id;
+    public String name;
     public float nx;
     public float ny;
     public float nw;
     public float nh;
     public float score;
     public float[] signature;
+    public float[] deepBodyEmbedding;
+    public float[] faceEmbedding;
+    public boolean hasDeepAi;
+    public boolean hasFaceAi;
     public long lastSeen;
 
     public TrackedPerson(int id, float nx, float ny, float nw, float nh, float score) {
@@ -21,6 +27,10 @@ public class TrackedPerson {
         this.nh = nh;
         this.score = score;
         this.lastSeen = System.currentTimeMillis();
+    }
+
+    public String displayLabel() {
+        return (name != null && !name.trim().isEmpty()) ? name.trim() : ("Kişi #" + id);
     }
 
     public float centerX() {

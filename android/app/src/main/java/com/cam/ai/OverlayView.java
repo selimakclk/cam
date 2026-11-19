@@ -306,9 +306,16 @@ public class OverlayView extends View {
                 }
                 fillScreenRect(lerpNx, lerpNy, lerpNw, lerpNh, front, tempRect);
                 int pct = Math.round(snapLocked.score * 100f);
-                String label = snapLocked.lost
-                        ? "HEDEF KAYIP!"
-                        : ("KİLİTLİ #" + snapLocked.id + " • %" + pct);
+                boolean hasCustomName = (snapLocked.name != null && !snapLocked.name.trim().isEmpty());
+                String aiBadge = snapLocked.hasFaceAi ? " • Yüz+AI" : (snapLocked.hasDeepAi ? " • AI" : "");
+                String label;
+                if (snapLocked.lost) {
+                    label = hasCustomName ? ("KAYIP: " + snapLocked.name.trim() + "!") : "HEDEF KAYIP!";
+                } else {
+                    label = hasCustomName
+                            ? ("KİLİTLİ • " + snapLocked.name.trim() + " • %" + pct + aiBadge)
+                            : ("KİLİTLİ #" + snapLocked.id + " • %" + pct + aiBadge);
+                }
                 drawLockedViewfinder(canvas, tempRect, snapLocked.lost, label, now);
                 if (snapLocked.lost) needContinueAnim = true;
             } else {
@@ -317,7 +324,12 @@ public class OverlayView extends View {
                     TrackedPerson p = persons.get(i);
                     fillScreenRect(p.nx, p.ny, p.nw, p.nh, front, tempRect);
                     int pct = Math.round(p.score * 100f);
-                    drawIdlePerson(canvas, tempRect, "İNSAN #" + p.id + " • %" + pct);
+                    boolean named = (p.name != null && !p.name.trim().isEmpty());
+                    String badge = p.hasFaceAi ? " • Yüz" : (p.hasDeepAi ? " • AI" : "");
+                    String idleLabel = named
+                            ? (p.name.trim() + " • %" + pct + badge)
+                            : ("İNSAN #" + p.id + " • %" + pct + badge);
+                    drawIdlePerson(canvas, tempRect, idleLabel);
                 }
             }
         }

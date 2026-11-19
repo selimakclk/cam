@@ -410,4 +410,141 @@ public class PersonDetectorInstrumentedTest {
             engine.close();
         }
     }
+
+    @Test
+    public void testDeepReIdAndFaceAiInitialization() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        java.io.File memFile = new java.io.File(ctx.getCacheDir(), "test_neural_init.bin");
+        if (memFile.exists()) memFile.delete();
+        PersonDetectorEngine engine = new PersonDetectorEngine(ctx, memFile);
+
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            assertTrue("SSD motoru baslatilamadi", engine.isInitialized());
+            assertTrue("MobileNetV3 Derin Re-ID hazir olmali", engine.isDeepReIdReady());
+            assertTrue("BlazeFace + MobileFaceNet yuz AI hazir olmali", engine.isFaceAiReady());
+
+            Bitmap roomBmp = BitmapFactory.decodeStream(is);
+            assertNotNull(roomBmp);
+
+            PersonDetectorEngine.AnalysisOutput out = engine.processFrame(roomBmp);
+            assertFalse("Odada kisi algilanmali", out.persons.isEmpty());
+            TrackedPerson p = out.persons.get(0);
+            assertTrue("Derin vucut AI gommesi cikarilmali", p.hasDeepAi);
+            assertNotNull("Derin vucut vektoru bos olmamali", p.deepBodyEmbedding);
+            assertTrue("Derin vucut vektor boyutu >= 128 olmali", p.deepBodyEmbedding.length >= 128);
+            assertTrue("Biyometrik yuz AI gommesi cikarilmali", p.hasFaceAi);
+            assertNotNull("Yuz vektoru bos olmamali", p.faceEmbedding);
+            assertTrue("Yuz vektor boyutu >= 128 olmali", p.faceEmbedding.length >= 128);
+        } finally {
+            engine.close();
+            if (memFile.exists()) memFile.delete();
+        }
+    }
+
+    @Test
+    public void testPersistentMemoryAndNamingAcrossAppRestart() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        java.io.File memFile = new java.io.File(ctx.getCacheDir(), "test_persist_mem.bin");
+        if (memFile.exists()) memFile.delete();
+
+        int savedId;
+        PersonDetectorEngine engine1 = new PersonDetectorEngine(ctx, memFile);
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            Bitmap roomBmp = BitmapFactory.decodeStream(is);
+            assertNotNull(roomBmp);
+
+            PersonDetectorEngine.AnalysisOutput out1 = engine1.processFrame(roomBmp);
+            assertFalse(out1.persons.isEmpty());
+            savedId = out1.persons.get(0).id;
+            assertTrue("Isimlendirme basarili olmali", engine1.renamePerson(savedId, "Selim"));
+        } finally {
+            engine1.close();
+        }
+
+        assertTrue("Kalici hafiza dosyasi diske yazilmis olmali", memFile.exists() && memFile.length() > 100);
+
+        // Uygulama yeniden acilmis gibi sifirdan yeni motor baslat
+        PersonDetectorEngine engine2 = new PersonDetectorEngine(ctx, memFile);
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            assertEquals("Kalici hafizadan 1 profil yuklenmeli", 1, engine2.getRememberedCount());
+            Bitmap roomBmp2 = BitmapFactory.decodeStream(is);
+            assertNotNull(roomBmp2);
+
+            PersonDetectorEngine.AnalysisOutput out2 = engine2.processFrame(roomBmp2);
+            assertFalse(out2.persons.isEmpty());
+            TrackedPerson recognized = out2.persons.get(0);
+            assertEquals("Yeniden baslatma sonrasi ayni ID taninmali", savedId, recognized.id);
+            assertEquals("Yeniden baslatma sonrasi kayitli isim hatirlanmali", "Selim", recognized.name);
+        } finally {
+            engine2.close();
+            if (memFile.exists()) memFile.delete();
+        }
+    }
+
+    @Test
+    public void testClothingChangeFaceRecognitionRecovery() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        java.io.File memFile = new java.io.File(ctx.getCacheDir(), "test_clothing_change.bin");
+        if (memFile.exists()) memFile.delete();
+        PersonDetectorEngine engine = new PersonDetectorEngine(ctx, memFile);
+
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            Bitmap roomBmp = BitmapFactory.decodeStream(is);
+            assertNotNull(roomBmp);
+
+            // 1. Kisi tespit edilir, yuz+vucut ogrenilir, isim verilir ve kilitlenir
+            PersonDetectorEngine.AnalysisOutput out1 = engine.processFrame(roomBmp);
+            assertFalse(out1.persons.isEmpty());
+            TrackedPerson person = out1.persons.get(0);
+            assertTrue("Test gorselinde yuz ogrenilmis olmali", person.hasFaceAi);
+            engine.renamePerson(person.id, "Ev Sahibi");
+
+            PersonDetectorEngine.LockedState lockSnap = new PersonDetectorEngine.LockedState();
+            assertEquals(PersonDetectorEngine.LockStatus.LOCKED,
+                    engine.tryLockAt(person.centerX(), person.centerY(), lockSnap));
+            int lockedId = lockSnap.id;
+            assertTrue("Kilitli hedefte yuz AI aktif olmali", lockSnap.hasFaceAi);
+
+            // 2. Kisi odadan cikar -> kayip alarmi tetiklenir
+            Bitmap blank = Bitmap.createBitmap(480, 360, Bitmap.Config.ARGB_8888);
+            blank.eraseColor(Color.BLACK);
+            engine.processFrame(blank);
+            Thread.sleep(1150);
+            PersonDetectorEngine.AnalysisOutput lostOut = engine.processFrame(blank);
+            assertTrue(lostOut.locked != null && lostOut.locked.lost);
+
+            // 3. Kisi tamamen farkli renkte kiyafet (parlak kirmizi/sari) giyip geri doner (yuzu ayni!)
+            Bitmap newOutfit = roomBmp.copy(Bitmap.Config.ARGB_8888, true);
+            android.graphics.Canvas c = new android.graphics.Canvas(newOutfit);
+            int rw = newOutfit.getWidth(), rh = newOutfit.getHeight();
+            int torsoLeft = Math.round((person.nx + person.nw * 0.14f) * rw);
+            int torsoRight = Math.round((person.nx + person.nw * 0.86f) * rw);
+            int torsoTop = Math.round((person.ny + person.nh * 0.28f) * rh);
+            int torsoMid = Math.round((person.ny + person.nh * 0.60f) * rh);
+            int legsBot = Math.round((person.ny + person.nh * 0.92f) * rh);
+
+            android.graphics.Paint redShirt = new android.graphics.Paint();
+            redShirt.setColor(Color.argb(215, 225, 35, 35));
+            c.drawRect(torsoLeft, torsoTop, torsoRight, torsoMid, redShirt);
+
+            android.graphics.Paint yellowPants = new android.graphics.Paint();
+            yellowPants.setColor(Color.argb(215, 235, 200, 30));
+            c.drawRect(torsoLeft, torsoMid, torsoRight, legsBot, yellowPants);
+
+            PersonDetectorEngine.AnalysisOutput rec = engine.processFrame(newOutfit);
+            if (rec.locked != null && rec.locked.lost) {
+                rec = engine.processFrame(newOutfit);
+            }
+            assertNotNull(rec.locked);
+            assertFalse("Kiyafet degisse bile biyometrik yuz AI ile geri taninmali!", rec.locked.lost);
+            assertEquals("Kiyafet degisimi sonrasi ayni ID korunmali", lockedId, rec.locked.id);
+            assertEquals("Kiyafet degisimi sonrasi isim korunmali", "Ev Sahibi", rec.locked.name);
+
+            newOutfit.recycle();
+            blank.recycle();
+        } finally {
+            engine.close();
+            if (memFile.exists()) memFile.delete();
+        }
+    }
 }

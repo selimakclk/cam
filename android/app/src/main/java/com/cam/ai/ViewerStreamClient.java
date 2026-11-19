@@ -520,14 +520,19 @@ public class ViewerStreamClient {
                     if (arr != null) {
                         for (int i = 0; i < arr.length(); i++) {
                             JSONObject o = arr.getJSONObject(i);
-                            persons.add(new TrackedPerson(
+                            TrackedPerson tp = new TrackedPerson(
                                     o.optInt("id", i + 1),
                                     (float) o.optDouble("x", 0),
                                     (float) o.optDouble("y", 0),
                                     (float) o.optDouble("w", 0),
                                     (float) o.optDouble("h", 0),
                                     (float) o.optDouble("s", 0.5)
-                            ));
+                            );
+                            String pName = o.optString("name", "");
+                            if (!pName.isEmpty()) tp.name = pName;
+                            tp.hasDeepAi = o.optBoolean("deep", false);
+                            tp.hasFaceAi = o.optBoolean("face", false);
+                            persons.add(tp);
                         }
                     }
 
@@ -536,12 +541,17 @@ public class ViewerStreamClient {
                         JSONObject lo = root.getJSONObject("locked");
                         locked = new PersonDetectorEngine.LockedState();
                         locked.id = lo.optInt("id", 1);
+                        String lName = lo.optString("name", "");
+                        if (!lName.isEmpty()) locked.name = lName;
                         locked.nx = (float) lo.optDouble("x", 0);
                         locked.ny = (float) lo.optDouble("y", 0);
                         locked.nw = (float) lo.optDouble("w", 0);
                         locked.nh = (float) lo.optDouble("h", 0);
                         locked.score = (float) lo.optDouble("s", 0.9);
                         locked.lost = lo.optBoolean("lost", false);
+                        locked.hasDeepAi = lo.optBoolean("deep", false);
+                        locked.hasFaceAi = lo.optBoolean("face", false);
+                        locked.memoryCount = lo.optInt("mem", 0);
                     }
 
                     listener.onAiState(w, h, isFront, alarm, persons, locked);

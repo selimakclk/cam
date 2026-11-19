@@ -72,6 +72,8 @@ public class MainActivity extends AppCompatActivity {
     private TextView txtCodeDisplay;
     private TextView txtFpsDisplay;
     private Button btnUnlock;
+    private Button btnNameTarget;
+    private Button btnMemory;
     private Button btnTorch;
 
     // İzleyici HUD Elemanları
@@ -191,6 +193,8 @@ public class MainActivity extends AppCompatActivity {
         txtCodeDisplay = findViewById(R.id.txtCodeDisplay);
         txtFpsDisplay = findViewById(R.id.txtFpsDisplay);
         btnUnlock = findViewById(R.id.btnUnlock);
+        btnNameTarget = findViewById(R.id.btnNameTarget);
+        btnMemory = findViewById(R.id.btnMemory);
         btnTorch = findViewById(R.id.btnTorch);
 
         viewerStream = findViewById(R.id.viewerStream);
@@ -214,10 +218,18 @@ public class MainActivity extends AppCompatActivity {
 
         // Kamera İçi Kontroller
         findViewById(R.id.btnStealth).setOnClickListener(v -> enterStealthMode());
+        btnMemory.setOnClickListener(v -> showMemoryManagerDialog());
         btnTorch.setOnClickListener(v -> toggleTorch());
         findViewById(R.id.btnFlip).setOnClickListener(v -> flipCamera());
         findViewById(R.id.btnBackMain).setOnClickListener(v -> returnToMain());
         btnUnlock.setOnClickListener(v -> unlockTarget());
+        btnNameTarget.setOnClickListener(v -> {
+            if (personEngine == null) return;
+            PersonDetectorEngine.LockedState locked = personEngine.getLockedStateSnapshot();
+            if (locked != null) {
+                promptRenamePersonDialog(locked.id, locked.name);
+            }
+        });
 
         // Alarm Kapatma
         findViewById(R.id.btnDismissAlarm).setOnClickListener(v -> {
@@ -603,12 +615,13 @@ public class MainActivity extends AppCompatActivity {
         } else if (out.targetJustRecovered) {
             dismissAlarm();
             if (out.locked != null) updateTargetHud(out.locked);
-        } else if (out.locked != null && !out.locked.lost) {
-            int pct = Math.round(out.locked.score * 100f);
-            String targetText = "Kilitli: Kişi #" + out.locked.id + " (%" + pct + ")";
-            if (!targetText.equals(lastTargetText)) {
-                lastTargetText = targetText;
-                txtTargetStatus.setText(targetText);
+        } else if (out.locked != null) {
+            updateTargetHud(out.locked);
+        }
+        if (btnMemory != null) {
+            String memLabel = (out.rememberedCount > 0) ? ("Hafıza (" + out.rememberedCount + ")") : "Hafıza";
+            if (!memLabel.equals(btnMemory.getText().toString())) {
+                btnMemory.setText(memLabel);
             }
         }
     }
@@ -620,13 +633,15 @@ public class MainActivity extends AppCompatActivity {
             newTargetText = "Kişiye dokunarak kilitleyin";
             newVis = View.GONE;
         } else if (locked.lost) {
-            newTargetText = (locked.memoryCount > 0)
-                    ? ("KAYIP: Kişi #" + locked.id + "! (Hafıza: " + locked.memoryCount + ")")
-                    : ("KAYIP: Kişi #" + locked.id + "!");
+            String aiInfo = buildMemoryBadge(locked);
+            newTargetText = aiInfo.isEmpty()
+                    ? ("KAYIP: " + locked.displayLabel() + "!")
+                    : ("KAYIP: " + locked.displayLabel() + "! (" + aiInfo + ")");
             newVis = View.VISIBLE;
         } else {
             int pct = Math.round(locked.score * 100f);
-            newTargetText = "Kilitli: Kişi #" + locked.id + " (%" + pct + ")";
+            String badge = locked.hasFaceAi ? " • Yüz+AI" : (locked.hasDeepAi ? " • Derin AI" : "");
+            newTargetText = "Kilitli: " + locked.displayLabel() + " (%" + pct + badge + ")";
             newVis = View.VISIBLE;
         }
         if (!newTargetText.equals(lastTargetText)) {
@@ -636,7 +651,109 @@ public class MainActivity extends AppCompatActivity {
         if (newVis != lastUnlockVisibility) {
             lastUnlockVisibility = newVis;
             btnUnlock.setVisibility(newVis);
+            if (btnNameTarget != null) btnNameTarget.setVisibility(newVis);
         }
+    }
+
+    private String buildMemoryBadge(PersonDetectorEngine.LockedState locked) {
+        if (locked == null) return "";
+        StringBuilder sb = new StringBuilder();
+        if (locked.faceCount > 0) sb.append("Yüz:").append(locked.faceCount);
+        if (locked.deepCount > 0) {
+            if (sb.length() > 0) sb.append(" ");
+            sb.append("AI:").append(locked.deepCount);
+        }
+        if (sb.length() == 0 && locked.memoryCount > 0) {
+            sb.append("Hafıza:").append(locked.memoryCount);
+        }
+        return sb.toString();
+    }
+
+    private void showMemoryManagerDialog() {
+        if (personEngine == null) {
+            Toast.makeText(this, "Yapay zeka motoru henüz hazırlanıyor", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        List<PersonMemoryStore.ProfileSummary> profiles = personEngine.getMemorySummaries();
+        String engineLine = "Motor: " + personEngine.getAiEngineSummary();
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Yapay Zeka Hafıza Bankası (" + profiles.size() + ")");
+
+        if (profiles.isEmpty()) {
+            builder.setMessage(engineLine + "\n\nHenüz kayıtlı kişi yok. Kamerada bir kişi göründüğünde yüz ve derin vücut vektörleri otomatik öğrenilip kalıcı hafızaya kaydedilir.");
+        } else {
+            CharSequence[] items = new CharSequence[profiles.size()];
+            for (int i = 0; i < profiles.size(); i++) {
+                PersonMemoryStore.ProfileSummary p = profiles.get(i);
+                StringBuilder line = new StringBuilder(p.displayLabel());
+                line.append("  •  Yüz: ").append(p.faceCount)
+                        .append("  •  Derin AI: ").append(p.deepCount)
+                        .append("  •  İmza: ").append(p.sigCount);
+                items[i] = line.toString();
+            }
+            builder.setItems(items, (dialog, which) -> {
+                PersonMemoryStore.ProfileSummary chosen = profiles.get(which);
+                showProfileActionDialog(chosen);
+            });
+            builder.setNeutralButton("Tümünü Temizle", (d, w) -> {
+                new AlertDialog.Builder(this)
+                        .setTitle("Hafızayı Temizle")
+                        .setMessage("Kayıtlı tüm kişi isimleri, yüz ve derin yapay zeka vektörleri kalıcı olarak silinsin mi?")
+                        .setPositiveButton("Sil", (d2, w2) -> {
+                            personEngine.clearAllMemory();
+                            btnMemory.setText("Hafıza");
+                            updateTargetHud(personEngine.getLockedStateSnapshot());
+                            Toast.makeText(this, "Kalıcı yapay zeka hafızası sıfırlandı", Toast.LENGTH_SHORT).show();
+                        })
+                        .setNegativeButton("İptal", null)
+                        .show();
+            });
+        }
+        builder.setPositiveButton("Kapat", null);
+        builder.show();
+    }
+
+    private void showProfileActionDialog(PersonMemoryStore.ProfileSummary profile) {
+        CharSequence[] actions = {"İsim Ver / Değiştir", "Bu Kişiyi Hafızadan Sil"};
+        new AlertDialog.Builder(this)
+                .setTitle(profile.displayLabel())
+                .setItems(actions, (d, which) -> {
+                    if (which == 0) {
+                        promptRenamePersonDialog(profile.id, profile.name);
+                    } else if (which == 1 && personEngine != null) {
+                        personEngine.deletePersonFromMemory(profile.id);
+                        updateTargetHud(personEngine.getLockedStateSnapshot());
+                        Toast.makeText(this, profile.displayLabel() + " hafızadan silindi", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("İptal", null)
+                .show();
+    }
+
+    private void promptRenamePersonDialog(int personId, String currentName) {
+        if (personEngine == null) return;
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle("Kişiye İsim Ver (#" + personId + ")");
+        b.setMessage("İsim verilen kişiler kalıcı hafızada saklanır; uygulama kapansa veya kıyafet değişse bile yüz/AI ile tanınır.");
+        final EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
+        input.setHint("Örn: Selim, Anne, Ev Sahibi");
+        if (currentName != null && !currentName.trim().isEmpty()) {
+            input.setText(currentName.trim());
+            input.setSelection(input.getText().length());
+        }
+        b.setView(input);
+        b.setPositiveButton("Kaydet", (d, w) -> {
+            String newName = input.getText().toString().trim();
+            personEngine.renamePerson(personId, newName);
+            PersonDetectorEngine.LockedState snap = personEngine.getLockedStateSnapshot();
+            updateTargetHud(snap);
+            overlayView.updateState(personEngine.getLatestPersonsSnapshot(), snap);
+            Toast.makeText(this, newName.isEmpty() ? "İsim kaldırıldı" : ("Kaydedildi: " + newName), Toast.LENGTH_SHORT).show();
+        });
+        b.setNegativeButton("İptal", null);
+        b.show();
     }
 
     private void showWarningBanner(String msg) {
@@ -913,9 +1030,10 @@ public class MainActivity extends AppCompatActivity {
                     int vv;
                     if (locked != null) {
                         int pct = Math.round(locked.score * 100f);
+                        String badge = locked.hasFaceAi ? " • Yüz+AI" : (locked.hasDeepAi ? " • AI" : "");
                         vt = locked.lost
-                                ? "KAYIP: Kişi #" + locked.id + "!"
-                                : "Kilitli: Kişi #" + locked.id + " (%" + pct + ")";
+                                ? "KAYIP: " + locked.displayLabel() + "!"
+                                : "Kilitli: " + locked.displayLabel() + " (%" + pct + badge + ")";
                         vv = View.VISIBLE;
                     } else {
                         int c = (persons != null) ? persons.size() : 0;

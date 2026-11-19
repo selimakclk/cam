@@ -1,6 +1,8 @@
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 -keep class com.cam.ai.** { *; }
 -keep class com.google.mediapipe.** { *; }
+-keep class org.tensorflow.lite.** { *; }
+-keep class com.google.ai.edge.litert.** { *; }
 -keep class com.google.common.flogger.** { *; }
 -keep class com.google.protobuf.** { *; }
 -keep class androidx.camera.** { *; }

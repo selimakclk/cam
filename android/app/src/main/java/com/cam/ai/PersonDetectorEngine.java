@@ -16,19 +16,22 @@ import com.google.mediapipe.tasks.core.Delegate;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector;
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 
 /**
- * Ultra-Hızlı Çok-Katmanlı İnsan Tespit ve Kalıcı Hafızalı Re-ID Takip Motoru.
- * Özellikler:
- *  - SSD MobileNet V2 (GPU hızlandırmalı + otomatik CPU geri dönüşlü) tek hafif model.
- *  - 30 FPS Optik NCC Şablon Takibi (fastTrackFrame) + Arka Plan Asenkron AI Düzeltme.
- *  - 3 Bölgeli Merkez-Ağırlıklı Re-ID İmzası (Baş/Omuz, Gövde, Bacak: 16x4 HSV + 12 Gri = 228 boyut).
- *  - Kişi Karışmasını Önleyen Sıkı Gövde Kimlik Kapısı ve Çakışma (Occlusion) Dondurma.
- *  - Çoklu-Açı Hafıza Bankası (8 kareye kadar kilitli hedef hafızası + 90 sn oda kişi hafızası).
+ * Ultra-Hızlı 3-Katmanlı Yapay Zeka İnsan Tespit, Biyometrik Yüz + Derin Re-ID ve Kalıcı Disk Hafızalı Takip Motoru.
+ *
+ * Katman 0 (Her Kamera Karesi, <1ms, Sıfır-GC): 30 FPS Optik NCC Şablon Takibi (fastTrackFrame).
+ * Katman 1 (Her AI Karesi, ~30ms): SSD MobileNet V2 + 129-D Çok-İpuculu İmza (Histogram + Chroma + Yapısal Desen).
+ * Katman 2 (Olay-Odaklı & Akıllı Zamanlamalı Derin AI):
+ *   - MediaPipe MobileNetV3-Small (1024-D Derin Vücut/Kıyafet Re-ID)
+ *   - MediaPipe BlazeFace + LiteRT MobileFaceNet (192-D Göz-Hizalamalı Biyometrik Yüz Tanıma)
+ *   - Kıyafet değişiminde yüz doğrulaması ile otomatik yeni kıyafet öğrenme + yüz uyuşmazlığında sahtekarlık vetosu.
+ * Katman 3 (Kalıcı Disk Hafızası): Uygulama kapansa dahi kişileri, yüz/vücut vektörlerini ve verilen isimleri saklar.
  */
 public class PersonDetectorEngine {
 
@@ -36,27 +39,32 @@ public class PersonDetectorEngine {
     private static final String MODEL_FILE = "ssd_mobilenet_v2.tflite";
     private static final float FULL_MIN_SCORE = 0.29f;
     private static final float CROP_MIN_SCORE = 0.24f;
-    private static final int MAX_FULL_SIDE = 448;
+    private static final int MAX_FULL_SIDE = 352; // SSD 300x300 girişi için optimum ultra-hızlı boyut
 
     private static final int ANA_W = 160;
     private static final int ANA_H = 120;
     private static final int HUE_BINS = 12;
     private static final int GRAY_BINS = 8;
-    private static final int ZONE_LEN = HUE_BINS + GRAY_BINS; // 20 (yumuşak dağılımlı renk+ton)
+    private static final int ZONE_LEN = HUE_BINS + GRAY_BINS; // 20
     private static final int NUM_ZONES = 3; // 0: Baş/Omuz, 1: Gövde, 2: Bacak
     private static final int HIST_TOTAL = ZONE_LEN * NUM_ZONES; // 60
-    private static final int CHROMA_LEN = NUM_ZONES * 3; // 9 (rg, yb, luma ortalamaları)
+    private static final int CHROMA_LEN = NUM_ZONES * 3; // 9 (rg, yb, luma)
     private static final int PATCH_W = 6;
     private static final int PATCH_H = 10;
-    private static final int PATCH_LEN = PATCH_W * PATCH_H; // 60 (aydınlatmadan bağımsız yapısal vücut deseni)
+    private static final int PATCH_LEN = PATCH_W * PATCH_H; // 60
     private static final int SIG_LEN = HIST_TOTAL + CHROMA_LEN + PATCH_LEN; // 129
     private static final int TPL_W = 16;
     private static final int TPL_H = 24;
 
     private static final int MAX_LOCKED_GALLERY = 12;
-    private static final int MAX_ROOM_MEMORY = 28;
-    private static final long ROOM_MEMORY_TTL_MS = 300_000L; // 5 dakika kalıcı oda hafızası
+    private static final int MAX_LOCKED_DEEP_GALLERY = 8;
+    private static final int MAX_LOCKED_FACE_GALLERY = 8;
     private static final long TARGET_LOST_TIMEOUT_MS = 1100L;
+
+    // Akıllı Derin AI Zamanlayıcı (normal karelerde 0ms ek yük, kritik anlarda anında derin doğrulama)
+    private static final int MAX_NEURAL_PER_FRAME = 2;
+    private static final long ENRICH_FAST_INTERVAL_MS = 900L;
+    private static final long ENRICH_STEADY_INTERVAL_MS = 2200L;
 
     public enum LockStatus {
         LOCKED,
@@ -65,26 +73,32 @@ public class PersonDetectorEngine {
 
     public static class LockedState {
         public int id;
+        public String name;
         public float nx, ny, nw, nh;
         public float score;
         public float vx, vy;
         public float baseArea;
         public float aspectRatio;
         public float[] anchorSig;
-        public List<float[]> gallery; // Slot 0 = değişmez anchor, 1..11 = temiz çoklu açı/ışık hafızası
+        public List<float[]> gallery; // 129-D çoklu açı/ışık imzaları (slot 0 = anchor)
+        public List<float[]> deepGallery; // 1024-D MobileNetV3 derin vücut vektörleri
+        public List<float[]> faceGallery; // 192-D MobileFaceNet biyometrik yüz vektörleri
         public float[] template;
         public long lastSeen;
         public long lastUpdate;
         public int recoverStreak;
         public int memoryCount;
+        public int deepCount;
+        public int faceCount;
+        public boolean hasDeepAi;
+        public boolean hasFaceAi;
+        public boolean needsImmediateNeural;
         public boolean isOccluded;
         public boolean lost;
-    }
 
-    private static class RememberedPerson {
-        int id;
-        long lastSeen;
-        final List<float[]> gallery = new ArrayList<>(6);
+        public String displayLabel() {
+            return (name != null && !name.trim().isEmpty()) ? name.trim() : ("Kişi #" + id);
+        }
     }
 
     public static class AnalysisOutput {
@@ -93,20 +107,25 @@ public class PersonDetectorEngine {
         public boolean targetJustLost;
         public boolean targetJustRecovered;
         public int inferTimeMs;
+        public int rememberedCount;
     }
 
     private ObjectDetector detector;
+    private final NeuralIdentityEngine neuralEngine;
+    private final PersonMemoryStore memoryStore;
     private volatile boolean initialized = false;
     private volatile boolean closed = false;
     private boolean usingGpu = false;
     private String initError = null;
 
     private final List<TrackedPerson> prevTracks = new ArrayList<>();
-    private final List<RememberedPerson> roomMemory = new ArrayList<>();
+    private final List<PersonMemoryStore.PersonProfile> roomMemory = new ArrayList<>();
     private int nextTrackId = 1;
     private TrackedPerson pendingRecoveryCandidate = null;
     private LockedState lockedTarget = null;
     private int frameCounter = 0;
+    private long lastEnrichTs = 0L;
+    private boolean memoryDirty = false;
 
     // AI Worker thread tamponları (yalnızca detectorLock altında kullanılır)
     private final int[] aiPixels = new int[ANA_W * ANA_H];
@@ -114,14 +133,19 @@ public class PersonDetectorEngine {
     private final Canvas aiSmallCanvas = new Canvas(aiSmallBitmap);
     private final Rect aiSrcRect = new Rect();
     private final Rect aiDstRect = new Rect(0, 0, ANA_W, ANA_H);
+    private final float[] aiTplScratch = new float[TPL_W * TPL_H];
+    private final float[] aiHitScratch = new float[2];
     private boolean aiPixelsValid = false;
 
-    // 30 FPS Optik Takip tamponları (yalnızca fastLock altında camera thread kullanır)
+    // 30 FPS Optik Takip tamponları (yalnızca fastLock altında, SIFIR per-kare tahsis!)
     private final int[] fastPixels = new int[ANA_W * ANA_H];
     private final Bitmap fastSmallBitmap = Bitmap.createBitmap(ANA_W, ANA_H, Bitmap.Config.ARGB_8888);
     private final Canvas fastSmallCanvas = new Canvas(fastSmallBitmap);
     private final Rect fastSrcRect = new Rect();
     private final Rect fastDstRect = new Rect(0, 0, ANA_W, ANA_H);
+    private final float[] fastTplScratch = new float[TPL_W * TPL_H];
+    private final float[] fastSigScratch = new float[SIG_LEN];
+    private final float[] fastHitScratch = new float[2];
 
     private final Paint fastDrawPaint = new Paint();
 
@@ -136,11 +160,30 @@ public class PersonDetectorEngine {
     private final Object fastLock = new Object();
 
     public PersonDetectorEngine(Context context) {
-        // Tüm Android telefonlarda (Mali/Adreno/PowerVR) sıfır sürücü çökmesi için güvenli CPU XNNPACK modu
+        this(context, null);
+    }
+
+    public PersonDetectorEngine(Context context, File customMemoryFile) {
+        this.memoryStore = (customMemoryFile != null)
+                ? new PersonMemoryStore(customMemoryFile)
+                : new PersonMemoryStore(context);
+
+        // Kalıcı disk hafızasını yükle
+        PersonMemoryStore.LoadResult loaded = memoryStore.load();
+        synchronized (stateLock) {
+            roomMemory.addAll(loaded.profiles);
+            nextTrackId = loaded.nextTrackId;
+        }
+
+        // Derin AI (MobileNetV3 + BlazeFace + MobileFaceNet) motorunu başlat
+        this.neuralEngine = new NeuralIdentityEngine(context);
+
+        // SSD MobileNet V2 insan tespiti (tüm telefonlarda 0 sürücü çökmesi için güvenli CPU XNNPACK)
         if (tryInitDetector(context, Delegate.CPU, false)) {
             usingGpu = false;
             initialized = true;
-            Log.i(TAG, "SSD MobileNet V2 (Güvenli Hızlı CPU Modu) başarıyla başlatıldı.");
+            Log.i(TAG, "Hibrit AI Motoru Hazır: " + neuralEngine.getActiveEnginesSummary()
+                    + " | Kalıcı Hafıza: " + loaded.profiles.size() + " kişi.");
         } else {
             initialized = false;
             Log.e(TAG, "AI Başlatma Hatası: " + initError);
@@ -190,13 +233,31 @@ public class PersonDetectorEngine {
         return usingGpu;
     }
 
+    public boolean isDeepReIdReady() {
+        return neuralEngine != null && neuralEngine.isBodyReady();
+    }
+
+    public boolean isFaceAiReady() {
+        return neuralEngine != null && neuralEngine.isFaceReady();
+    }
+
+    public String getAiEngineSummary() {
+        return (neuralEngine != null) ? neuralEngine.getActiveEnginesSummary() : "SSD + 129-D";
+    }
+
     public String getInitError() {
         return initError;
     }
 
+    public int getRememberedCount() {
+        synchronized (stateLock) {
+            return roomMemory.size();
+        }
+    }
+
     /**
-     * Kamera thread'inden her karede (<3ms) çalışarak kilitli hedefi 25-30 FPS yumuşaklıkta takip eder.
-     * Yalnızca mevcut kilit pozisyonunu akıcı tutar; AI yokluğunu uzatmaz (kayıp alarmı AI kararına bağlı kalır).
+     * Kamera thread'inden her karede (<1ms, SIFIR heap tahsisi) çalışarak kilitli hedefi 30 FPS yumuşaklıkta takip eder.
+     * AI motorlarını ASLA beklemez.
      */
     public LockedState fastTrackFrame(Bitmap uprightBitmap) {
         if (closed || uprightBitmap == null || uprightBitmap.isRecycled()) {
@@ -224,7 +285,8 @@ public class PersonDetectorEngine {
             anchorSnap = lockedTarget.anchorSig;
         }
 
-        float[] hit = null;
+        boolean foundHit = false;
+        float hitX = 0f, hitY = 0f;
         synchronized (fastLock) {
             if (closed || fastSmallBitmap.isRecycled() || uprightBitmap.isRecycled()) {
                 return getLockedStateSnapshot();
@@ -233,13 +295,14 @@ public class PersonDetectorEngine {
             fastSmallCanvas.drawBitmap(uprightBitmap, fastSrcRect, fastDstRect, fastDrawPaint);
             fastSmallBitmap.getPixels(fastPixels, 0, ANA_W, 0, 0, ANA_W, ANA_H);
 
-            hit = searchTemplate(fastPixels, tplSnap, predX, predY, pw, ph, 0.72f);
-            if (hit != null) {
-                float[] sig = computeSignature(fastPixels, hit[0], hit[1], pw, ph);
-                if (sig != null && anchorSnap != null) {
-                    float torsoCheck = zoneSim(anchorSnap, sig, 1);
-                    if (torsoCheck < 0.54f) {
-                        hit = null;
+            if (searchTemplateZeroAlloc(fastPixels, tplSnap, predX, predY, pw, ph, 0.72f, fastTplScratch, fastHitScratch)) {
+                hitX = fastHitScratch[0];
+                hitY = fastHitScratch[1];
+                foundHit = true;
+                if (anchorSnap != null && computeSignatureInto(fastPixels, hitX, hitY, pw, ph, fastSigScratch)) {
+                    float torsoCheck = zoneSim(anchorSnap, fastSigScratch, 1);
+                    if (torsoCheck < 0.50f) {
+                        foundHit = false;
                     }
                 }
             }
@@ -249,17 +312,17 @@ public class PersonDetectorEngine {
             if (lockedTarget == null || lockedTarget.id != idSnapshot || lockedTarget.lost || lockedTarget.isOccluded) {
                 return (lockedTarget != null) ? copyLockedState(lockedTarget) : null;
             }
-            if (hit != null) {
+            if (foundHit) {
                 float prevCx = lockedTarget.nx + lockedTarget.nw * 0.5f;
                 float prevCy = lockedTarget.ny + lockedTarget.nh * 0.5f;
-                float newCx = hit[0] + pw * 0.5f;
-                float newCy = hit[1] + ph * 0.5f;
+                float newCx = hitX + pw * 0.5f;
+                float newCy = hitY + ph * 0.5f;
                 long dt = Math.max(8L, now - lockedTarget.lastUpdate);
 
                 lockedTarget.vx = pvx * 0.65f + ((newCx - prevCx) / dt) * 0.35f;
                 lockedTarget.vy = pvy * 0.65f + ((newCy - prevCy) / dt) * 0.35f;
-                lockedTarget.nx = Math.max(0f, Math.min(0.98f, hit[0]));
-                lockedTarget.ny = Math.max(0f, Math.min(0.98f, hit[1]));
+                lockedTarget.nx = Math.max(0f, Math.min(0.98f, hitX));
+                lockedTarget.ny = Math.max(0f, Math.min(0.98f, hitY));
                 lockedTarget.lastUpdate = now;
             }
             return copyLockedState(lockedTarget);
@@ -284,9 +347,12 @@ public class PersonDetectorEngine {
         int bh = uprightBitmap.getHeight();
         frameCounter++;
 
-        // 1. Tam kadraj AI insan tespiti & izole tamponlar
         List<TrackedPerson> candidates;
         LockedState currentLocked;
+        List<TrackedPerson> prevSnapshot;
+        List<PersonMemoryStore.PersonProfile> saveSnapshot = null;
+        int saveNextId = 1;
+
         synchronized (detectorLock) {
             if (closed || detector == null || uprightBitmap.isRecycled()) {
                 return out;
@@ -307,6 +373,7 @@ public class PersonDetectorEngine {
                 detCanvas.drawBitmap(uprightBitmap, detSrcRect, detDstRect, fastDrawPaint);
                 detBmp = detBitmap;
             }
+            // NOT: detBmp yeniden kullanıldığı için mpImage.close() çağrılmaz (close() bitmap'i recycle eder).
             MPImage mpImage = new BitmapImageBuilder(detBmp).build();
             ObjectDetectorResult res = detector.detect(mpImage);
             candidates = convertDetections(res.detections(), detBmp.getWidth(), detBmp.getHeight(), 0f, 0f, 1f, 1f, FULL_MIN_SCORE);
@@ -316,6 +383,7 @@ public class PersonDetectorEngine {
 
             synchronized (stateLock) {
                 currentLocked = (lockedTarget != null) ? copyLockedState(lockedTarget) : null;
+                prevSnapshot = new ArrayList<>(prevTracks);
             }
 
             if (currentLocked != null) {
@@ -334,7 +402,7 @@ public class PersonDetectorEngine {
                 candidates = mergeDetections(candidates, farDets);
             }
 
-            // 2. Re-ID imzalarını AI küçük tamponundan çıkar (detectorLock içinde tamamen thread-safe)
+            // 2. Hızlı 129-D Re-ID imzalarını AI küçük tamponundan çıkar (<0.2ms)
             if (!candidates.isEmpty() || currentLocked != null) {
                 ensureAiPixelsLocked(uprightBitmap);
                 for (TrackedPerson p : candidates) {
@@ -342,24 +410,168 @@ public class PersonDetectorEngine {
                 }
             }
 
+            // 3. Akıllı Olay-Odaklı Derin AI (MobileNetV3 + BlazeFace + MobileFaceNet) — stateLock TUTMADAN çalışır!
+            if (!candidates.isEmpty() && (neuralEngine.isBodyReady() || neuralEngine.isFaceReady())) {
+                long nowPre = System.currentTimeMillis();
+                runAdaptiveNeuralExtractionLocked(uprightBitmap, candidates, prevSnapshot, currentLocked, nowPre);
+            }
+
+            // 4. Kimlik eşleştirme & hafıza güncelleme (kısa stateLock bloğu: <0.3ms)
             synchronized (stateLock) {
                 long now = System.currentTimeMillis();
-
-                // 3. Kilitli hedef takibi + Hafıza Bankasına göre kimlik doğrulama
                 pendingRecoveryCandidate = null;
                 if (lockedTarget != null) {
                     updateLockedTargetLocked(candidates, now, out);
                     out.locked = copyLockedState(lockedTarget);
                 }
 
-                // 4. Tüm kişilere kimlik ve 5 dk oda hafızası ile kararlı ID ata
                 assignStableIdsWithMemoryLocked(candidates, now);
                 out.persons = candidates;
+                out.rememberedCount = roomMemory.size();
+
+                if (memoryDirty) {
+                    memoryDirty = false;
+                    saveSnapshot = snapshotRoomMemoryLocked();
+                    saveNextId = nextTrackId;
+                }
             }
+        }
+
+        if (saveSnapshot != null) {
+            memoryStore.saveDebouncedAsync(saveSnapshot, saveNextId);
         }
 
         out.inferTimeMs = (int) (System.currentTimeMillis() - t0);
         return out;
+    }
+
+    /**
+     * Akıllı zamanlayıcı: Normal sabit takipte karelerin ~%90'ında 0ms harcar.
+     * Kişi yeni girdiğinde, kilitli hedef kayıpken geri döndüğünde, ilk kilitte,
+     * çakışmada veya periyodik zenginleştirmede Derin Vücut + Yüz AI vektörlerini çıkarır.
+     */
+    private void runAdaptiveNeuralExtractionLocked(
+            Bitmap fullBitmap,
+            List<TrackedPerson> candidates,
+            List<TrackedPerson> prevSnapshot,
+            LockedState lockedSnap,
+            long now) {
+        int budget = MAX_NEURAL_PER_FRAME;
+        List<TrackedPerson> selected = new ArrayList<>(MAX_NEURAL_PER_FRAME);
+
+        // Öncelik 1: Kilitli hedef KAYIP ise geri dönüş adaylarına anında Derin Vücut + Yüz AI çalıştır!
+        if (lockedSnap != null && lockedSnap.lost) {
+            List<TrackedPerson> byArea = new ArrayList<>(candidates);
+            Collections.sort(byArea, (a, b) -> Float.compare(b.area(), a.area()));
+            for (TrackedPerson c : byArea) {
+                if (budget <= 0) break;
+                selected.add(c);
+                budget--;
+            }
+        }
+
+        // Öncelik 2: Kilitli hedef yeni kilitlendiyse (tryLockFast) ilk AI karesinde hemen zenginleştir
+        if (budget > 0 && lockedSnap != null && !lockedSnap.lost && lockedSnap.needsImmediateNeural) {
+            TrackedPerson bestLockCand = findBestOverlapCandidate(candidates, lockedSnap.nx, lockedSnap.ny, lockedSnap.nw, lockedSnap.nh);
+            if (bestLockCand != null && !selected.contains(bestLockCand)) {
+                selected.add(bestLockCand);
+                budget--;
+            }
+        }
+
+        // Öncelik 3: Kadraja YENİ GİREN (önceki karede örtüşmeyen) kişiler -> kalıcı/oda hafızasından AI ile tanı!
+        if (budget > 0) {
+            for (TrackedPerson c : candidates) {
+                if (budget <= 0) break;
+                if (selected.contains(c)) continue;
+                boolean matchedPrevPos = false;
+                for (TrackedPerson prev : prevSnapshot) {
+                    if (computeIoU(c.nx, c.ny, c.nw, c.nh, prev.nx, prev.ny, prev.nw, prev.nh) > 0.18f) {
+                        matchedPrevPos = true;
+                        break;
+                    }
+                }
+                if (!matchedPrevPos) {
+                    selected.add(c);
+                    budget--;
+                }
+            }
+        }
+
+        // Öncelik 4: İki kişi birbiriyle çakışıyorsa (kimlik karışmasını önlemek için her 3 karede bir AI kontrolü)
+        if (budget > 0 && candidates.size() >= 2 && (frameCounter % 3 == 0)) {
+            for (int i = 0; i < candidates.size() && budget > 0; i++) {
+                TrackedPerson a = candidates.get(i);
+                if (selected.contains(a)) continue;
+                for (int j = 0; j < candidates.size(); j++) {
+                    if (i == j) continue;
+                    TrackedPerson b = candidates.get(j);
+                    if (computeIoU(a.nx, a.ny, a.nw, a.nh, b.nx, b.ny, b.nw, b.nh) > 0.12f) {
+                        selected.add(a);
+                        budget--;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Öncelik 5: Arka plan periyodik çoklu-açı zenginleştirme (sakin karelerde 1 temiz kişi)
+        if (selected.isEmpty()) {
+            boolean needFastEnrich = (lockedSnap != null && !lockedSnap.lost
+                    && (lockedSnap.deepCount < 4 || lockedSnap.faceCount < 3));
+            long interval = needFastEnrich ? ENRICH_FAST_INTERVAL_MS : ENRICH_STEADY_INTERVAL_MS;
+            if (now - lastEnrichTs >= interval) {
+                TrackedPerson target = null;
+                if (lockedSnap != null && !lockedSnap.lost) {
+                    TrackedPerson lc = findBestOverlapCandidate(candidates, lockedSnap.nx, lockedSnap.ny, lockedSnap.nw, lockedSnap.nh);
+                    if (lc != null && !isEdgeClipped(lc.nx, lc.ny, lc.nw, lc.nh)) {
+                        target = lc;
+                    }
+                }
+                if (target == null) {
+                    // Temiz, en büyük kişiyi seç (dönüşümlü indeks)
+                    int startIdx = frameCounter % candidates.size();
+                    for (int k = 0; k < candidates.size(); k++) {
+                        TrackedPerson c = candidates.get((startIdx + k) % candidates.size());
+                        if (!isEdgeClipped(c.nx, c.ny, c.nw, c.nh) && c.score >= 0.36f) {
+                            target = c;
+                            break;
+                        }
+                    }
+                }
+                if (target != null) {
+                    selected.add(target);
+                    lastEnrichTs = now;
+                }
+            }
+        }
+
+        // Seçilen adaylar için Derin Vücut + Biyometrik Yüz vektörlerini çıkar
+        for (TrackedPerson c : selected) {
+            NeuralIdentityEngine.NeuralFeatures feat =
+                    neuralEngine.extractFeatures(fullBitmap, c.nx, c.ny, c.nw, c.nh, true, true);
+            if (feat.bodyEmbedding != null) {
+                c.deepBodyEmbedding = feat.bodyEmbedding;
+                c.hasDeepAi = true;
+            }
+            if (feat.faceEmbedding != null) {
+                c.faceEmbedding = feat.faceEmbedding;
+                c.hasFaceAi = true;
+            }
+        }
+    }
+
+    private TrackedPerson findBestOverlapCandidate(List<TrackedPerson> candidates, float nx, float ny, float nw, float nh) {
+        TrackedPerson best = null;
+        float bestIoU = 0.25f;
+        for (TrackedPerson c : candidates) {
+            float iou = computeIoU(c.nx, c.ny, c.nw, c.nh, nx, ny, nw, nh);
+            if (iou > bestIoU) {
+                bestIoU = iou;
+                best = c;
+            }
+        }
+        return best;
     }
 
     private void ensureAiPixelsLocked(Bitmap src) {
@@ -377,9 +589,6 @@ public class PersonDetectorEngine {
         }
     }
 
-    /**
-     * Önce önbellekteki AI kişilerinden anında (<1ms) kilit dener; gerekirse allowZoom=true ile yakınlaştırma yapar.
-     */
     public LockStatus tryLockAt(float normX, float normY, LockedState outLocked) {
         return tryLockInternal(normX, normY, outLocked, true);
     }
@@ -414,10 +623,23 @@ public class PersonDetectorEngine {
             return LockStatus.EMPTY_AREA;
         }
 
+        float[] extractedBody = best.deepBodyEmbedding;
+        float[] extractedFace = best.faceEmbedding;
+        List<PersonMemoryStore.PersonProfile> saveSnapshot = null;
+        int saveNextId = 1;
+
         synchronized (detectorLock) {
             Bitmap snap = lastAiBitmap;
             if (!closed && snap != null && !snap.isRecycled()) {
                 ensureAiPixelsLocked(snap);
+                // allowZoom=true (aiExecutor yolu) ise anında Derin Vücut + Yüz AI vektörlerini çıkar!
+                if (allowZoom && (extractedBody == null || extractedFace == null)) {
+                    NeuralIdentityEngine.NeuralFeatures feat = neuralEngine.extractFeatures(
+                            snap, best.nx, best.ny, best.nw, best.nh,
+                            extractedBody == null, extractedFace == null);
+                    if (extractedBody == null && feat.bodyEmbedding != null) extractedBody = feat.bodyEmbedding;
+                    if (extractedFace == null && feat.faceEmbedding != null) extractedFace = feat.faceEmbedding;
+                }
             }
             int[] pxSource = aiPixels;
             if (best.signature == null && aiPixelsValid) {
@@ -428,6 +650,7 @@ public class PersonDetectorEngine {
                 long now = System.currentTimeMillis();
                 LockedState t = new LockedState();
                 t.id = (best.id > 0) ? best.id : nextTrackId++;
+                t.name = best.name;
                 t.nx = best.nx;
                 t.ny = best.ny;
                 t.nw = best.nw;
@@ -440,10 +663,16 @@ public class PersonDetectorEngine {
                 t.anchorSig = (best.signature != null)
                         ? best.signature.clone()
                         : (aiPixelsValid ? computeSignature(pxSource, best.nx, best.ny, best.nw, best.nh) : null);
+
                 t.gallery = new ArrayList<>(MAX_LOCKED_GALLERY);
-                if (t.anchorSig != null) {
-                    t.gallery.add(t.anchorSig.clone());
-                }
+                if (t.anchorSig != null) t.gallery.add(t.anchorSig.clone());
+
+                t.deepGallery = new ArrayList<>(MAX_LOCKED_DEEP_GALLERY);
+                if (extractedBody != null) t.deepGallery.add(extractedBody.clone());
+
+                t.faceGallery = new ArrayList<>(MAX_LOCKED_FACE_GALLERY);
+                if (extractedFace != null) t.faceGallery.add(extractedFace.clone());
+
                 t.template = aiPixelsValid ? extractTemplate(pxSource, best.nx, best.ny, best.nw, best.nh) : null;
                 t.lastSeen = now;
                 t.lastUpdate = now;
@@ -451,34 +680,75 @@ public class PersonDetectorEngine {
                 t.isOccluded = false;
                 t.lost = false;
 
-                lockedTarget = t;
-                // Daha önce oda hafızasında varsa mevcut açı örneklerini birleştir
-                for (RememberedPerson mem : roomMemory) {
-                    if (mem.id == t.id) {
-                        for (float[] g : mem.gallery) {
-                            if (t.gallery.size() < MAX_LOCKED_GALLERY) t.gallery.add(g.clone());
-                        }
-                        break;
+                // Kalıcı/oda hafızasından bu kişinin mevcut tüm isim, yüz, derin vücut ve imza örneklerini aktar
+                PersonMemoryStore.PersonProfile prof = findProfileByIdLocked(t.id);
+                if (prof != null) {
+                    if (prof.isNamed()) t.name = prof.name;
+                    for (float[] g : prof.sigGallery) {
+                        if (t.gallery.size() < MAX_LOCKED_GALLERY) t.gallery.add(g.clone());
+                    }
+                    for (float[] d : prof.deepBodyGallery) {
+                        addDiverseEmbedding(t.deepGallery, d, MAX_LOCKED_DEEP_GALLERY, 0.93f);
+                    }
+                    for (float[] f : prof.faceGallery) {
+                        addDiverseEmbedding(t.faceGallery, f, MAX_LOCKED_FACE_GALLERY, 0.93f);
                     }
                 }
+                // Yeni çıkarılan vektörleri de profille senkronize et
+                updateRoomMemoryLocked(t.id, t.anchorSig, extractedBody, extractedFace, now, false);
+
+                t.needsImmediateNeural = (t.deepGallery.isEmpty() || (neuralEngine.isFaceReady() && t.faceGallery.isEmpty()));
+                lockedTarget = t;
+
                 if (outLocked != null) {
                     copyInto(t, outLocked);
                 }
-                return LockStatus.LOCKED;
+                if (memoryDirty) {
+                    memoryDirty = false;
+                    saveSnapshot = snapshotRoomMemoryLocked();
+                    saveNextId = nextTrackId;
+                }
             }
         }
+
+        if (saveSnapshot != null) {
+            memoryStore.saveDebouncedAsync(saveSnapshot, saveNextId);
+        }
+        return LockStatus.LOCKED;
     }
 
     public void unlock() {
+        List<PersonMemoryStore.PersonProfile> saveSnap = null;
+        int saveNextId = 1;
         synchronized (stateLock) {
-            if (lockedTarget != null && lockedTarget.gallery != null) {
+            if (lockedTarget != null) {
                 long now = System.currentTimeMillis();
-                for (float[] g : lockedTarget.gallery) {
-                    updateRoomMemoryLocked(lockedTarget.id, g, now);
+                if (lockedTarget.gallery != null) {
+                    for (float[] g : lockedTarget.gallery) {
+                        updateRoomMemoryLocked(lockedTarget.id, g, null, null, now, false);
+                    }
+                }
+                if (lockedTarget.deepGallery != null) {
+                    for (float[] d : lockedTarget.deepGallery) {
+                        updateRoomMemoryLocked(lockedTarget.id, null, d, null, now, false);
+                    }
+                }
+                if (lockedTarget.faceGallery != null) {
+                    for (float[] f : lockedTarget.faceGallery) {
+                        updateRoomMemoryLocked(lockedTarget.id, null, null, f, now, false);
+                    }
+                }
+                if (memoryDirty) {
+                    memoryDirty = false;
+                    saveSnap = snapshotRoomMemoryLocked();
+                    saveNextId = nextTrackId;
                 }
             }
             lockedTarget = null;
             pendingRecoveryCandidate = null;
+        }
+        if (saveSnap != null) {
+            memoryStore.saveDebouncedAsync(saveSnap, saveNextId);
         }
     }
 
@@ -486,6 +756,112 @@ public class PersonDetectorEngine {
         synchronized (stateLock) {
             return (lockedTarget != null) ? copyLockedState(lockedTarget) : null;
         }
+    }
+
+    // =================== KULLANICI HAFIZA YÖNETİMİ (İSİMLENDİRME / LİSTE / TEMİZLEME) ===================
+    public List<PersonMemoryStore.ProfileSummary> getMemorySummaries() {
+        synchronized (stateLock) {
+            List<PersonMemoryStore.ProfileSummary> list = new ArrayList<>(roomMemory.size());
+            for (PersonMemoryStore.PersonProfile p : roomMemory) {
+                list.add(new PersonMemoryStore.ProfileSummary(
+                        p.id, p.name, p.sigGallery.size(), p.deepBodyGallery.size(), p.faceGallery.size(), p.lastSeen));
+            }
+            Collections.sort(list, (a, b) -> {
+                boolean an = (a.name != null && !a.name.trim().isEmpty());
+                boolean bn = (b.name != null && !b.name.trim().isEmpty());
+                if (an != bn) return an ? -1 : 1;
+                return Long.compare(b.lastSeen, a.lastSeen);
+            });
+            return list;
+        }
+    }
+
+    public boolean renamePerson(int id, String rawName) {
+        String cleanName = (rawName != null && !rawName.trim().isEmpty()) ? rawName.trim() : null;
+        List<PersonMemoryStore.PersonProfile> snap;
+        int saveNextId;
+        boolean found = false;
+        synchronized (stateLock) {
+            PersonMemoryStore.PersonProfile p = findProfileByIdLocked(id);
+            if (p != null) {
+                p.name = cleanName;
+                p.lastSeen = System.currentTimeMillis();
+                found = true;
+            }
+            if (lockedTarget != null && lockedTarget.id == id) {
+                lockedTarget.name = cleanName;
+                found = true;
+            }
+            for (TrackedPerson tp : prevTracks) {
+                if (tp.id == id) tp.name = cleanName;
+            }
+            snap = snapshotRoomMemoryLocked();
+            saveNextId = nextTrackId;
+            memoryDirty = false;
+        }
+        if (found) {
+            memoryStore.saveSync(snap, saveNextId);
+        }
+        return found;
+    }
+
+    public boolean deletePersonFromMemory(int id) {
+        List<PersonMemoryStore.PersonProfile> snap = null;
+        int saveNextId = 1;
+        boolean removed = false;
+        synchronized (stateLock) {
+            Iterator<PersonMemoryStore.PersonProfile> it = roomMemory.iterator();
+            while (it.hasNext()) {
+                if (it.next().id == id) {
+                    it.remove();
+                    removed = true;
+                    break;
+                }
+            }
+            if (lockedTarget != null && lockedTarget.id == id) {
+                lockedTarget.name = null;
+            }
+            for (TrackedPerson tp : prevTracks) {
+                if (tp.id == id) tp.name = null;
+            }
+            if (removed) {
+                snap = snapshotRoomMemoryLocked();
+                saveNextId = nextTrackId;
+                memoryDirty = false;
+            }
+        }
+        if (snap != null) {
+            memoryStore.saveSync(snap, saveNextId);
+        }
+        return removed;
+    }
+
+    public void clearAllMemory() {
+        synchronized (stateLock) {
+            roomMemory.clear();
+            prevTracks.clear();
+            nextTrackId = 1;
+            if (lockedTarget != null) {
+                lockedTarget.name = null;
+            }
+            memoryDirty = false;
+        }
+        memoryStore.clearFile();
+    }
+
+    private List<PersonMemoryStore.PersonProfile> snapshotRoomMemoryLocked() {
+        List<PersonMemoryStore.PersonProfile> copy = new ArrayList<>(roomMemory.size());
+        for (PersonMemoryStore.PersonProfile p : roomMemory) {
+            copy.add(p.deepCopy());
+        }
+        return copy;
+    }
+
+    private PersonMemoryStore.PersonProfile findProfileByIdLocked(int id) {
+        for (PersonMemoryStore.PersonProfile p : roomMemory) {
+            if (p.id == id) return p;
+        }
+        return null;
     }
 
     private TrackedPerson findPersonAtLocked(float nx, float ny, List<TrackedPerson> list) {
@@ -533,7 +909,7 @@ public class PersonDetectorEngine {
             Bitmap cropped = Bitmap.createBitmap(src, px, py, pw, ph);
             MPImage cropMp = new BitmapImageBuilder(cropped).build();
             ObjectDetectorResult res = detector.detect(cropMp);
-            cropMp.close();
+            cropMp.close(); // cropMp.close() geçici cropped bitmap'i güvenli şekilde recycle eder.
 
             return convertDetections(res.detections(), pw, ph, (float) px / sw, (float) py / sh, (float) pw / sw, (float) ph / sh, CROP_MIN_SCORE);
         } catch (Exception e) {
@@ -588,17 +964,16 @@ public class PersonDetectorEngine {
     }
 
     /**
-     * Kişilere hem görsel benzerlik hem 90 sn oda hafızası ile kararlı ID atar.
-     * İki kişi yan yana geçtiğinde ID'ler yer değiştirmez; çıkıp tekrar girdiğinde aynı ID korunur.
+     * Kişilere Konum + 129-D İmza + 1024-D Derin Vücut AI + 192-D Biyometrik Yüz AI + Kalıcı Disk Hafızası ile kararlı ID ve isim atar.
      */
     private void assignStableIdsWithMemoryLocked(List<TrackedPerson> current, long now) {
-        // Eski hafızayı temizle (kilitli ID varsa onu silme)
-        Iterator<RememberedPerson> it = roomMemory.iterator();
+        Iterator<PersonMemoryStore.PersonProfile> it = roomMemory.iterator();
         while (it.hasNext()) {
-            RememberedPerson m = it.next();
+            PersonMemoryStore.PersonProfile m = it.next();
             boolean isLocked = (lockedTarget != null && lockedTarget.id == m.id);
-            if (!isLocked && (now - m.lastSeen > ROOM_MEMORY_TTL_MS)) {
+            if (!isLocked && PersonMemoryStore.isExpired(m, now)) {
                 it.remove();
+                memoryDirty = true;
             }
         }
 
@@ -606,23 +981,26 @@ public class PersonDetectorEngine {
         List<TrackedPerson> needMemoryMatch = new ArrayList<>();
         List<Integer> usedIds = new ArrayList<>();
 
-        // Kilitli hedef zaten belirlendiyse (veya geri yakalama onaylanıyorsa) o ID'yi rezerve et
         if (lockedTarget != null) {
             if (!lockedTarget.lost) {
                 for (TrackedPerson c : current) {
                     if (computeIoU(c.nx, c.ny, c.nw, c.nh, lockedTarget.nx, lockedTarget.ny, lockedTarget.nw, lockedTarget.nh) > 0.55f) {
                         c.id = lockedTarget.id;
+                        c.name = lockedTarget.name;
+                        c.hasDeepAi = c.hasDeepAi || (lockedTarget.deepGallery != null && !lockedTarget.deepGallery.isEmpty());
+                        c.hasFaceAi = c.hasFaceAi || (lockedTarget.faceGallery != null && !lockedTarget.faceGallery.isEmpty());
                         usedIds.add(c.id);
                         break;
                     }
                 }
             } else if (pendingRecoveryCandidate != null) {
                 pendingRecoveryCandidate.id = lockedTarget.id;
+                pendingRecoveryCandidate.name = lockedTarget.name;
                 usedIds.add(lockedTarget.id);
             }
         }
 
-        // 1. Aşama: Önceki karedeki aktif kişilerle KONUM + ÇOK-İPUCULU RE-ID eşleştirmesi (karışmayı önler)
+        // 1. Aşama: Önceki karedeki aktif kişilerle KONUM + HİBRİT AI eşleştirmesi
         for (TrackedPerson cur : current) {
             if (cur.id > 0) continue;
 
@@ -635,16 +1013,26 @@ public class PersonDetectorEngine {
                 float dist = (float) Math.hypot(cur.centerX() - prev.centerX(), cur.centerY() - prev.centerY());
                 float posScore = iou * 1.4f + Math.max(0f, 0.35f - dist) * 2.0f;
 
+                PersonMemoryStore.PersonProfile prof = findProfileByIdLocked(prev.id);
+                HybridMatch hm = null;
                 float appScore = 0.65f;
                 float torso = 0.65f;
-                if (cur.signature != null && prev.signature != null) {
+                if (prof != null) {
+                    hm = matchProfileHybrid(prof.sigGallery, prof.deepBodyGallery, prof.faceGallery, cur, legsCropped);
+                    if (hm.faceVetoed) continue; // İki farklı yüz birbirinin ID'sini ASLA çalamaz!
+                    appScore = hm.combined;
+                    torso = hm.torso;
+                } else if (cur.signature != null && prev.signature != null) {
                     appScore = reidSim(cur.signature, prev.signature, legsCropped);
                     torso = zoneSim(cur.signature, prev.signature, 1);
-                    if ((prevTracks.size() > 1 || current.size() > 1) && (appScore < 0.56f || torso < 0.48f)) {
-                        continue;
-                    }
                 }
-                float total = posScore + appScore * 2.6f + torso * 1.0f;
+
+                if ((prevTracks.size() > 1 || current.size() > 1) && !(hm != null && hm.faceMatched)
+                        && (appScore < 0.56f || torso < 0.48f)) {
+                    continue;
+                }
+                float total = posScore + appScore * 2.7f + torso * 1.0f;
+                if (hm != null && hm.faceMatched) total += 1.5f;
                 if (total > bestScore) {
                     bestScore = total;
                     bestPrev = prev;
@@ -653,6 +1041,7 @@ public class PersonDetectorEngine {
 
             if (bestPrev != null) {
                 cur.id = bestPrev.id;
+                cur.name = bestPrev.name;
                 usedIds.add(cur.id);
                 unmatchedPrev.remove(bestPrev);
             } else {
@@ -660,30 +1049,48 @@ public class PersonDetectorEngine {
             }
         }
 
-        // 2. Aşama: Kadraja yeniden giren kişileri 5 dakikalık çoklu-ipucu Re-ID hafızasında ara
+        // 2. Aşama: Kadraja yeni/tekrar giren kişileri Kalıcı Disk + Derin Vücut + Biyometrik Yüz Hafızasında ara!
         for (TrackedPerson cur : needMemoryMatch) {
-            RememberedPerson bestMem = null;
+            PersonMemoryStore.PersonProfile bestMem = null;
+            HybridMatch bestMatch = null;
             float bestSim = 0f;
             boolean legsCropped = (cur.ny + cur.nh > 0.94f);
 
-            if (cur.signature != null) {
-                for (RememberedPerson mem : roomMemory) {
-                    if (usedIds.contains(mem.id)) continue;
-                    if (lockedTarget != null && lockedTarget.id == mem.id) continue;
+            for (PersonMemoryStore.PersonProfile mem : roomMemory) {
+                if (usedIds.contains(mem.id)) continue;
+                if (lockedTarget != null && lockedTarget.id == mem.id) continue;
 
-                    GalleryMatch gm = matchGallery(mem.gallery, cur.signature, legsCropped);
-                    if (gm.combined >= 0.70f && gm.torso >= 0.60f && gm.combined > bestSim) {
-                        bestSim = gm.combined;
-                        bestMem = mem;
-                    }
+                HybridMatch hm = matchProfileHybrid(mem.sigGallery, mem.deepBodyGallery, mem.faceGallery, cur, legsCropped);
+                if (hm.faceVetoed) continue;
+
+                boolean accepted;
+                if (hm.faceMatched) {
+                    accepted = true; // Biyometrik yüz eşleşmesi kıyafet değişiminde bile tanır!
+                } else if (hm.deepUsed) {
+                    accepted = (hm.combined >= 0.68f && hm.torso >= 0.50f && hm.deepSim >= 0.54f);
+                } else {
+                    accepted = (hm.combined >= 0.70f && hm.torso >= 0.60f);
+                }
+
+                if (accepted && hm.combined > bestSim) {
+                    bestSim = hm.combined;
+                    bestMem = mem;
+                    bestMatch = hm;
                 }
             }
 
             if (bestMem != null) {
                 cur.id = bestMem.id;
+                cur.name = bestMem.name;
                 usedIds.add(cur.id);
+                // Yüz tanımayla kıyafet değişimi yakalandıysa yeni kıyafetini profile otomatik ekle!
+                if (bestMatch != null && bestMatch.faceMatched) {
+                    updateRoomMemoryLocked(cur.id, cur.signature, cur.deepBodyEmbedding, cur.faceEmbedding, now, true);
+                }
             } else {
-                while (usedIds.contains(nextTrackId) || (lockedTarget != null && lockedTarget.id == nextTrackId)) {
+                while (usedIds.contains(nextTrackId)
+                        || (lockedTarget != null && lockedTarget.id == nextTrackId)
+                        || findProfileByIdLocked(nextTrackId) != null) {
                     nextTrackId = (nextTrackId >= 999) ? 1 : nextTrackId + 1;
                 }
                 cur.id = nextTrackId++;
@@ -692,10 +1099,18 @@ public class PersonDetectorEngine {
             }
         }
 
-        // 3. Aşama: Hafızayı temiz, kenardan kesilmemiş çoklu açı örnekleriyle güncelle
+        // 3. Aşama: Hafızayı temiz, kenardan kesilmemiş çoklu açı + Derin Vücut + Yüz örnekleriyle besle
         for (TrackedPerson cur : current) {
             cur.lastSeen = now;
-            if (cur.signature == null || cur == pendingRecoveryCandidate) continue;
+            PersonMemoryStore.PersonProfile existing = findProfileByIdLocked(cur.id);
+            if (existing != null) {
+                if (existing.isNamed()) cur.name = existing.name;
+                cur.hasDeepAi = cur.hasDeepAi || !existing.deepBodyGallery.isEmpty();
+                cur.hasFaceAi = cur.hasFaceAi || !existing.faceGallery.isEmpty();
+            }
+
+            if (cur == pendingRecoveryCandidate) continue;
+            if (cur.signature == null && cur.deepBodyEmbedding == null && cur.faceEmbedding == null) continue;
             if (isEdgeClipped(cur.nx, cur.ny, cur.nw, cur.nh)) continue;
 
             boolean crowded = false;
@@ -706,7 +1121,12 @@ public class PersonDetectorEngine {
                 }
             }
             if (!crowded) {
-                updateRoomMemoryLocked(cur.id, cur.signature, now);
+                updateRoomMemoryLocked(cur.id, cur.signature, cur.deepBodyEmbedding, cur.faceEmbedding, now, false);
+                PersonMemoryStore.PersonProfile updated = findProfileByIdLocked(cur.id);
+                if (updated != null) {
+                    cur.hasDeepAi = !updated.deepBodyGallery.isEmpty();
+                    cur.hasFaceAi = !updated.faceGallery.isEmpty();
+                }
             }
         }
 
@@ -714,39 +1134,94 @@ public class PersonDetectorEngine {
         prevTracks.addAll(current);
     }
 
-    private void updateRoomMemoryLocked(int id, float[] sig, long now) {
-        RememberedPerson target = null;
-        for (RememberedPerson m : roomMemory) {
-            if (m.id == id) {
-                target = m;
-                break;
+    private void updateRoomMemoryLocked(
+            int id, float[] sig, float[] deepBody, float[] face, long now, boolean forceClothingAdapt) {
+        PersonMemoryStore.PersonProfile target = findProfileByIdLocked(id);
+        if (target == null) {
+            if (roomMemory.size() >= PersonMemoryStore.MAX_PROFILES) {
+                // İsimlendirilmiş profilleri koru; en eski isimsiz profili çıkar
+                PersonMemoryStore.PersonProfile evict = null;
+                for (PersonMemoryStore.PersonProfile m : roomMemory) {
+                    boolean isLocked = (lockedTarget != null && lockedTarget.id == m.id);
+                    if (isLocked || m.isNamed()) continue;
+                    if (evict == null || m.lastSeen < evict.lastSeen) evict = m;
+                }
+                if (evict == null) {
+                    for (PersonMemoryStore.PersonProfile m : roomMemory) {
+                        boolean isLocked = (lockedTarget != null && lockedTarget.id == m.id);
+                        if (isLocked) continue;
+                        if (evict == null || m.lastSeen < evict.lastSeen) evict = m;
+                    }
+                }
+                if (evict != null) roomMemory.remove(evict);
+            }
+            target = new PersonMemoryStore.PersonProfile();
+            target.id = id;
+            target.firstSeen = now;
+            target.lastSeen = now;
+            if (sig != null) target.sigGallery.add(sig.clone());
+            if (deepBody != null) target.deepBodyGallery.add(deepBody.clone());
+            if (face != null) target.faceGallery.add(face.clone());
+            roomMemory.add(target);
+            memoryDirty = true;
+            return;
+        }
+
+        boolean changed = false;
+        if (sig != null) {
+            if (target.sigGallery.isEmpty()) {
+                target.sigGallery.add(sig.clone());
+                changed = true;
+            } else {
+                float bestSim = 0f;
+                for (float[] g : target.sigGallery) {
+                    bestSim = Math.max(bestSim, reidSim(g, sig, false));
+                }
+                if (forceClothingAdapt || bestSim < 0.89f) {
+                    if (target.sigGallery.size() >= PersonMemoryStore.MAX_SIG_PER_PROFILE) {
+                        target.sigGallery.remove(forceClothingAdapt ? 0 : 1);
+                    }
+                    target.sigGallery.add(sig.clone());
+                    changed = true;
+                }
             }
         }
-        if (target == null) {
-            if (roomMemory.size() >= MAX_ROOM_MEMORY) {
-                RememberedPerson oldest = roomMemory.get(0);
-                for (RememberedPerson m : roomMemory) {
-                    if (m.lastSeen < oldest.lastSeen) oldest = m;
-                }
-                roomMemory.remove(oldest);
+        if (deepBody != null) {
+            if (addDiverseEmbedding(target.deepBodyGallery, deepBody, PersonMemoryStore.MAX_DEEP_PER_PROFILE,
+                    forceClothingAdapt ? 0.96f : 0.90f)) {
+                changed = true;
             }
-            target = new RememberedPerson();
-            target.id = id;
-            target.gallery.add(sig.clone());
-            roomMemory.add(target);
-        } else {
-            float bestSim = 0f;
-            for (float[] g : target.gallery) {
-                bestSim = Math.max(bestSim, reidSim(g, sig, false));
-            }
-            if (bestSim < 0.89f) {
-                if (target.gallery.size() >= 6) {
-                    target.gallery.remove(1);
-                }
-                target.gallery.add(sig.clone());
+        }
+        if (face != null) {
+            if (addDiverseEmbedding(target.faceGallery, face, PersonMemoryStore.MAX_FACE_PER_PROFILE, 0.91f)) {
+                changed = true;
             }
         }
         target.lastSeen = now;
+        if (changed) memoryDirty = true;
+    }
+
+    private static boolean addDiverseEmbedding(List<float[]> gallery, float[] vec, int maxLen, float dupThreshold) {
+        if (gallery == null || vec == null) return false;
+        if (gallery.isEmpty()) {
+            gallery.add(vec.clone());
+            return true;
+        }
+        float bestSim = -1f;
+        for (float[] existing : gallery) {
+            if (existing.length == vec.length) {
+                bestSim = Math.max(bestSim, NeuralIdentityEngine.cosineSim(existing, vec));
+            }
+        }
+        if (bestSim < dupThreshold) {
+            if (gallery.size() >= maxLen) {
+                // Slot 0 = ilk temiz anchor; en eski ikincil örneği (slot 1) döndür
+                gallery.remove(gallery.size() > 1 ? 1 : 0);
+            }
+            gallery.add(vec.clone());
+            return true;
+        }
+        return false;
     }
 
     private void updateLockedTargetLocked(List<TrackedPerson> detections, long now, AnalysisOutput out) {
@@ -762,11 +1237,12 @@ public class PersonDetectorEngine {
         TrackedPerson best = null;
         float bestScore = -Float.MAX_VALUE;
         float bestIoU = 0f;
-        float bestGallerySimMatched = 0f;
+        float bestCombinedMatched = 0f;
         float bestAnchorSimMatched = 0f;
+        boolean bestFaceMatched = false;
 
         for (TrackedPerson d : detections) {
-            if (d.signature == null) continue;
+            if (d.signature == null && d.deepBodyEmbedding == null && d.faceEmbedding == null) continue;
 
             float iou = computeIoU(predX, predY, predW, predH, d.nx, d.ny, d.nw, d.nh);
             float pcx = predX + predW * 0.5f, pcy = predY + predH * 0.5f;
@@ -777,34 +1253,51 @@ public class PersonDetectorEngine {
             float aspectSim = Math.min(dAspect / Math.max(0.01f, t.aspectRatio), t.aspectRatio / Math.max(0.01f, dAspect));
             boolean legsCropped = (d.ny + d.nh > 0.94f);
 
-            // Çoklu-Açı/Işık Hafıza Bankasındaki tüm görünümlerle (En yüksek + ilk 2 ortalama) kıyasla
-            GalleryMatch gm = matchGallery(t.gallery, d.signature, legsCropped);
-            float anchorSim = (t.anchorSig != null) ? reidSim(t.anchorSig, d.signature, legsCropped) : gm.combined;
-            float anchorTorso = (t.anchorSig != null) ? zoneSim(t.anchorSig, d.signature, 1) : gm.torso;
+            // 3-Katmanlı Hibrit Eşleştirme: Biyometrik Yüz + Derin Vücut AI + 129-D Çoklu-İpucu İmza
+            HybridMatch hm = matchProfileHybrid(t.gallery, t.deepGallery, t.faceGallery, d, legsCropped);
+            if (hm.faceVetoed) continue; // Farklı yüzlü kişi kilitli hedefi ASLA çalamaz!
+
+            float anchorSim = (t.anchorSig != null && d.signature != null)
+                    ? reidSim(t.anchorSig, d.signature, legsCropped)
+                    : hm.combined;
+            float anchorTorso = (t.anchorSig != null && d.signature != null)
+                    ? zoneSim(t.anchorSig, d.signature, 1)
+                    : hm.torso;
 
             float score;
             if (!t.lost) {
-                if (gm.combined < 0.54f || Math.max(gm.torso, anchorTorso) < 0.48f) continue;
-                if (sizeRatio < 0.16f) continue;
-                score = gm.combined * 4.0f + gm.torso * 1.5f + iou * 1.5f
+                if (!hm.faceMatched) {
+                    if (hm.combined < 0.53f || Math.max(hm.torso, anchorTorso) < 0.46f) continue;
+                    if (sizeRatio < 0.16f) continue;
+                }
+                score = hm.combined * 4.2f + hm.torso * 1.4f + iou * 1.5f
                         + aspectSim * 0.45f - (dist / Math.max(0.05f, diag)) * 0.45f + sizeRatio * 0.35f;
+                if (hm.faceMatched) score += 2.2f;
             } else {
-                // Çıkıp giren kişiyi ışık/konum/yakınlık değişiminde dahi yüksek doğrulukla geri yakala
-                if (gm.combined < 0.68f || gm.torso < 0.58f) continue;
-                if (sizeRatio < 0.08f || (!legsCropped && aspectSim < 0.30f)) continue;
-                score = gm.combined * 4.5f + gm.torso * 1.8f + anchorSim * 1.0f + sizeRatio * 0.3f;
+                // Kayıpken geri yakalama: Biyometrik yüz varsa kıyafet değişiminde bile yakala!
+                if (hm.faceMatched) {
+                    score = hm.combined * 5.8f + sizeRatio * 0.3f + 2.5f;
+                } else if (hm.deepUsed) {
+                    if (hm.combined < 0.65f || hm.torso < 0.48f || hm.deepSim < 0.50f) continue;
+                    if (sizeRatio < 0.08f || (!legsCropped && aspectSim < 0.28f)) continue;
+                    score = hm.combined * 4.8f + hm.deepSim * 1.8f + hm.torso * 1.2f + anchorSim * 0.8f + sizeRatio * 0.3f;
+                } else {
+                    if (hm.combined < 0.68f || hm.torso < 0.58f) continue;
+                    if (sizeRatio < 0.08f || (!legsCropped && aspectSim < 0.30f)) continue;
+                    score = hm.combined * 4.5f + hm.torso * 1.8f + anchorSim * 1.0f + sizeRatio * 0.3f;
+                }
             }
 
             if (score > bestScore) {
                 bestScore = score;
                 best = d;
                 bestIoU = iou;
-                bestGallerySimMatched = gm.combined;
+                bestCombinedMatched = hm.combined;
                 bestAnchorSimMatched = anchorSim;
+                bestFaceMatched = hm.faceMatched;
             }
         }
 
-        // Çakışma (occlusion) kontrolü
         boolean conflicted = false;
         if (best != null) {
             for (TrackedPerson other : detections) {
@@ -816,17 +1309,16 @@ public class PersonDetectorEngine {
         }
         t.isOccluded = conflicted;
 
-        // Kayıpken kişi geri göründüyse 2 kare (veya >=0.77 çok-ipucu eşleşmesi) ile anında yakala
         if (t.lost) {
             if (best != null) {
                 pendingRecoveryCandidate = best;
                 t.recoverStreak++;
-                if (t.recoverStreak >= 2 || bestGallerySimMatched >= 0.77f) {
+                if (bestFaceMatched || t.recoverStreak >= 2 || bestCombinedMatched >= 0.76f) {
                     t.lost = false;
                     t.recoverStreak = 0;
                     t.vx = 0f;
                     t.vy = 0f;
-                    applyMatchedPosition(t, best, now, conflicted, bestIoU, bestGallerySimMatched, bestAnchorSimMatched);
+                    applyMatchedPosition(t, best, now, conflicted, bestIoU, bestCombinedMatched, bestAnchorSimMatched, bestFaceMatched);
                     out.targetJustRecovered = true;
                 }
             } else {
@@ -835,19 +1327,17 @@ public class PersonDetectorEngine {
             return;
         }
 
-        // Aktif takipte AI bulduysa güncelle ve çoklu açı/ışık hafızasını besle
         if (best != null) {
-            applyMatchedPosition(t, best, now, conflicted, bestIoU, bestGallerySimMatched, bestAnchorSimMatched);
+            applyMatchedPosition(t, best, now, conflicted, bestIoU, bestCombinedMatched, bestAnchorSimMatched, bestFaceMatched);
             return;
         }
 
-        // AI bu karede kaçırdıysa ama kayıp süresi dolmadıysa NCC piksel şablonu + hız ile tut
-        float[] tplHit = (now - t.lastSeen < 650 && t.template != null)
-                ? searchTemplate(aiPixels, t.template, predX, predY, predW, predH, 0.70f)
-                : null;
-        if (tplHit != null) {
-            t.nx = Math.max(0f, Math.min(0.98f, tplHit[0]));
-            t.ny = Math.max(0f, Math.min(0.98f, tplHit[1]));
+        // AI bu karede kaçırdıysa ama kayıp süresi dolmadıysa sıfır-GC NCC piksel şablonu + hız ile tut
+        boolean tplFound = (now - t.lastSeen < 650 && t.template != null)
+                && searchTemplateZeroAlloc(aiPixels, t.template, predX, predY, predW, predH, 0.70f, aiTplScratch, aiHitScratch);
+        if (tplFound) {
+            t.nx = Math.max(0f, Math.min(0.98f, aiHitScratch[0]));
+            t.ny = Math.max(0f, Math.min(0.98f, aiHitScratch[1]));
             t.lastUpdate = now;
         } else if (now - t.lastSeen < 450) {
             t.nx = Math.max(-0.12f, Math.min(0.95f, predX));
@@ -862,7 +1352,7 @@ public class PersonDetectorEngine {
 
     private void applyMatchedPosition(
             LockedState t, TrackedPerson best, long now,
-            boolean conflicted, float bestIoU, float maxGallerySim, float anchorSim) {
+            boolean conflicted, float bestIoU, float maxCombinedSim, float anchorSim, boolean faceMatched) {
         float prevCx = t.nx + t.nw * 0.5f;
         float prevCy = t.ny + t.nh * 0.5f;
         float newCx = best.centerX();
@@ -881,18 +1371,41 @@ public class PersonDetectorEngine {
         t.lastSeen = now;
         t.lastUpdate = now;
 
-        // Kenardan kesilmemiş, çakışmasız ve anchor'a bağlı temiz görünümleri çoklu hafızaya ekle
-        if (!conflicted && best.signature != null && best.score >= 0.34f
+        // Kilitli hedef temiz görünüyorsa (veya biyometrik yüz doğrulandıysa) tüm hafıza bankalarını zenginleştir
+        boolean cleanView = !conflicted && best.score >= 0.34f
                 && !isEdgeClipped(best.nx, best.ny, best.nw, best.nh)
-                && (bestIoU > 0.28f || t.lost) && anchorSim >= 0.58f) {
-            if (t.gallery == null) t.gallery = new ArrayList<>(MAX_LOCKED_GALLERY);
-            if (t.gallery.isEmpty() && t.anchorSig != null) t.gallery.add(t.anchorSig.clone());
-            if (maxGallerySim < 0.89f) {
-                if (t.gallery.size() >= MAX_LOCKED_GALLERY) {
-                    t.gallery.remove(1);
+                && (bestIoU > 0.25f || t.lost || faceMatched);
+
+        if (cleanView) {
+            if (best.signature != null && (faceMatched || anchorSim >= 0.56f)) {
+                if (t.gallery == null) t.gallery = new ArrayList<>(MAX_LOCKED_GALLERY);
+                if (t.gallery.isEmpty() && t.anchorSig != null) t.gallery.add(t.anchorSig.clone());
+                // Yüz eşleşti ama kıyafet değiştiyse yeni kıyafet görünümünü zorla öğren!
+                boolean clothingChanged = faceMatched && anchorSim < 0.62f;
+                if (clothingChanged || maxCombinedSim < 0.89f) {
+                    if (t.gallery.size() >= MAX_LOCKED_GALLERY) {
+                        t.gallery.remove(1);
+                    }
+                    t.gallery.add(best.signature.clone());
+                    if (clothingChanged) {
+                        t.anchorSig = best.signature.clone();
+                    }
                 }
-                t.gallery.add(best.signature.clone());
             }
+            if (best.deepBodyEmbedding != null) {
+                if (t.deepGallery == null) t.deepGallery = new ArrayList<>(MAX_LOCKED_DEEP_GALLERY);
+                addDiverseEmbedding(t.deepGallery, best.deepBodyEmbedding, MAX_LOCKED_DEEP_GALLERY,
+                        faceMatched ? 0.95f : 0.90f);
+                t.needsImmediateNeural = false;
+            }
+            if (best.faceEmbedding != null) {
+                if (t.faceGallery == null) t.faceGallery = new ArrayList<>(MAX_LOCKED_FACE_GALLERY);
+                addDiverseEmbedding(t.faceGallery, best.faceEmbedding, MAX_LOCKED_FACE_GALLERY, 0.91f);
+                t.needsImmediateNeural = false;
+            }
+            // Kalıcı profili de anlık senkronize et
+            updateRoomMemoryLocked(t.id, best.signature, best.deepBodyEmbedding, best.faceEmbedding, now, faceMatched);
+
             float[] newTpl = extractTemplate(aiPixels, t.nx, t.ny, t.nw, t.nh);
             if (newTpl != null) t.template = newTpl;
         }
@@ -902,9 +1415,99 @@ public class PersonDetectorEngine {
         return nx < 0.02f || (nx + nw) > 0.98f || ny < 0.02f || (ny + nh) > 0.98f;
     }
 
+    // =================== 3-KATMANLI HİBRİT EŞLEŞTİRME (YÜZ + DERİN VÜCUT + 129-D) ===================
     private static class GalleryMatch {
         float combined;
         float torso;
+    }
+
+    private static class HybridMatch {
+        float combined;
+        float torso;
+        float deepSim = -1f;
+        float faceSim = -1f;
+        boolean deepUsed;
+        boolean faceMatched;
+        boolean faceVetoed;
+    }
+
+    private HybridMatch matchProfileHybrid(
+            List<float[]> sigGallery,
+            List<float[]> deepGallery,
+            List<float[]> faceGallery,
+            TrackedPerson cand,
+            boolean legsCropped) {
+        HybridMatch hm = new HybridMatch();
+        GalleryMatch sigGm = matchGallery(sigGallery, cand.signature, legsCropped);
+        float deepSim = matchEmbeddingGallery(deepGallery, cand.deepBodyEmbedding);
+        float faceSim = matchEmbeddingGallery(faceGallery, cand.faceEmbedding);
+
+        hm.deepSim = deepSim;
+        hm.faceSim = faceSim;
+        hm.torso = sigGm.torso;
+
+        // 1. Vücut/Kıyafet Skoru (Derin MobileNetV3 + 129-D Çok-İpuculu Füzyon)
+        float bodyScore = sigGm.combined;
+        if (deepSim >= 0f) {
+            hm.deepUsed = true;
+            if (sigGm.combined > 0f) {
+                bodyScore = deepSim * 0.58f + sigGm.combined * 0.42f;
+                if (deepSim >= 0.74f) {
+                    // Derin yapay zeka çok eminse sert ışık kaymasının HSV gövde skorunu bozmasını engelle
+                    hm.torso = Math.max(hm.torso, deepSim * 0.80f);
+                } else if (deepSim < 0.46f) {
+                    // Derin yapay zeka açıkça farklı vücut/kıyafet diyorsa düz renk benzerliğini bastır
+                    bodyScore = Math.min(bodyScore, deepSim * 0.78f + sigGm.combined * 0.22f);
+                }
+            } else {
+                bodyScore = deepSim;
+                hm.torso = deepSim * 0.85f;
+            }
+        }
+
+        // 2. Biyometrik Yüz Entegrasyonu (Kıyafet-Bağımsız Tanıma + Farklı Yüz Vetosu)
+        if (faceSim >= 0f) {
+            if (faceSim >= 0.64f) {
+                hm.faceMatched = true;
+                float faceBoosted = Math.min(0.99f, 0.22f + faceSim * 0.82f);
+                hm.combined = Math.max(bodyScore, faceBoosted);
+                hm.torso = Math.max(hm.torso, 0.72f);
+            } else if (faceSim >= 0.52f) {
+                hm.combined = faceSim * 0.55f + bodyScore * 0.45f;
+            } else if (faceSim < 0.36f) {
+                // İki net yüz birbirinden tamamen farklı -> güçlü veto!
+                hm.faceVetoed = true;
+                hm.combined = bodyScore * 0.42f;
+                hm.torso = hm.torso * 0.45f;
+            } else {
+                hm.combined = faceSim * 0.30f + bodyScore * 0.70f;
+            }
+        } else {
+            hm.combined = bodyScore;
+        }
+        return hm;
+    }
+
+    private static float matchEmbeddingGallery(List<float[]> gallery, float[] cand) {
+        if (gallery == null || gallery.isEmpty() || cand == null) return -1f;
+        float best1 = -1f, best2 = -1f;
+        int validCount = 0;
+        for (float[] g : gallery) {
+            if (g == null || g.length != cand.length) continue;
+            float s = NeuralIdentityEngine.cosineSim(g, cand);
+            validCount++;
+            if (s > best1) {
+                best2 = best1;
+                best1 = s;
+            } else if (s > best2) {
+                best2 = s;
+            }
+        }
+        if (validCount == 0) return -1f;
+        float score = (validCount >= 2 && best2 > 0f)
+                ? Math.max(best1 * 0.92f, best1 * 0.68f + best2 * 0.32f)
+                : best1;
+        return Math.max(0f, Math.min(1f, score));
     }
 
     private GalleryMatch matchGallery(List<float[]> gallery, float[] candSig, boolean legsCropped) {
@@ -914,6 +1517,7 @@ public class PersonDetectorEngine {
         float best1 = 0f, best2 = 0f;
         float bestTorso = 0f;
         for (float[] g : gallery) {
+            if (g == null || g.length != SIG_LEN) continue;
             float s = reidSim(g, candSig, legsCropped);
             if (s > best1) {
                 best2 = best1;
@@ -928,24 +1532,30 @@ public class PersonDetectorEngine {
         return gm;
     }
 
-    // =================== YUMUŞAK DAĞILIMLI 3-BÖLGELİ RE-ID + CHROMA + YAPISAL DESEN ===================
+    // =================== YUMUŞAK DAĞILIMLI 3-BÖLGELİ 129-D RE-ID + CHROMA + YAPISAL DESEN ===================
     private float[] computeSignature(int[] pixels, float nx, float ny, float nw, float nh) {
+        float[] sig = new float[SIG_LEN];
+        return computeSignatureInto(pixels, nx, ny, nw, nh, sig) ? sig : null;
+    }
+
+    private boolean computeSignatureInto(int[] pixels, float nx, float ny, float nw, float nh, float[] sig) {
         int x0 = Math.max(0, (int) Math.floor((nx + nw * 0.16f) * ANA_W));
         int x1 = Math.min(ANA_W, (int) Math.ceil((nx + nw * 0.84f) * ANA_W));
         int yHead0 = Math.max(0, (int) Math.floor((ny + nh * 0.04f) * ANA_H));
         int yHead1 = Math.min(ANA_H, Math.max(yHead0 + 1, (int) Math.floor((ny + nh * 0.25f) * ANA_H)));
         int yTorso1 = Math.min(ANA_H, Math.max(yHead1 + 1, (int) Math.floor((ny + nh * 0.57f) * ANA_H)));
         int yLegs1 = Math.min(ANA_H, Math.max(yTorso1 + 1, (int) Math.ceil((ny + nh * 0.90f) * ANA_H)));
-        if (x1 - x0 < 2 || yLegs1 - yHead0 < 6) return null;
+        if (x1 - x0 < 2 || yLegs1 - yHead0 < 6) return false;
+
+        for (int i = 0; i < SIG_LEN; i++) sig[i] = 0f;
 
         float centerX = (x0 + x1) * 0.5f;
         float halfW = Math.max(1f, (x1 - x0) * 0.5f);
-        float[] sig = new float[SIG_LEN];
         accumulateZoneHistAndChroma(pixels, x0, yHead0, x1, yHead1, centerX, halfW, sig, 0, HIST_TOTAL);
         accumulateZoneHistAndChroma(pixels, x0, yHead1, x1, yTorso1, centerX, halfW, sig, ZONE_LEN, HIST_TOTAL + 3);
         accumulateZoneHistAndChroma(pixels, x0, yTorso1, x1, yLegs1, centerX, halfW, sig, ZONE_LEN * 2, HIST_TOTAL + 6);
         extractStructuralPatch(pixels, nx + nw * 0.18f, ny + nh * 0.06f, nw * 0.64f, nh * 0.82f, sig, HIST_TOTAL + CHROMA_LEN);
-        return sig;
+        return true;
     }
 
     private void accumulateZoneHistAndChroma(
@@ -969,13 +1579,11 @@ public class PersonDetectorEngine {
                 float ndx = (px + 0.5f - cx) / halfW;
                 float weight = Math.max(0.25f, 1.0f - 0.65f * ndx * ndx);
 
-                // Aydınlatmadan bağımsız normalize rakip renk kanalları (RG, YB)
                 float denom = r + g + b + 32f;
                 rgAcc += ((r - g) / denom) * weight;
                 ybAcc += ((r + g - 2f * b) / (2f * denom)) * weight;
                 lumAcc += ((0.299f * r + 0.587f * g + 0.114f * b) / 255f) * weight;
 
-                // Komşu binlere yumuşak üçgensel dağıtım (ışık/WB kaymasında sert düşüşü önler)
                 if (s < 0.16f || v < 0.12f) {
                     int gb = Math.min(GRAY_BINS - 1, (int) Math.floor(v * GRAY_BINS));
                     int gbL = Math.max(0, gb - 1);
@@ -1057,7 +1665,6 @@ public class PersonDetectorEngine {
             colorSim = head * 0.20f + torso * 0.52f + legs * 0.28f;
         }
 
-        // Normalize rakip renk + üst-alt gövde parlaklık kontrast uyumu (ışık değişiminden etkilenmez)
         float rg1A = a[HIST_TOTAL + 3], yb1A = a[HIST_TOTAL + 4];
         float rg1B = b[HIST_TOTAL + 3], yb1B = b[HIST_TOTAL + 4];
         float torsoChromaDist = Math.abs(rg1A - rg1B) + Math.abs(yb1A - yb1B);
@@ -1075,7 +1682,6 @@ public class PersonDetectorEngine {
         }
         float chromaSim = torsoChromaSim * 0.65f + contrastSim * 0.35f;
 
-        // 6x10 yapısal vücut silüet/desen benzerliği
         int pOff = HIST_TOTAL + CHROMA_LEN;
         float dot = 0f;
         for (int i = 0; i < PATCH_LEN; i++) {
@@ -1086,58 +1692,64 @@ public class PersonDetectorEngine {
         return colorSim * 0.52f + chromaSim * 0.26f + patchSim * 0.22f;
     }
 
+    // =================== SIFIR-TAHSİSLİ 30 FPS OPTİK ŞABLON TAKİBİ ===================
     private float[] extractTemplate(int[] pixels, float nx, float ny, float nw, float nh) {
-        if (nw <= 0.004f || nh <= 0.008f) return null;
         float[] tpl = new float[TPL_W * TPL_H];
+        return extractTemplateInto(pixels, nx, ny, nw, nh, tpl) ? tpl : null;
+    }
+
+    private boolean extractTemplateInto(int[] pixels, float nx, float ny, float nw, float nh, float[] tpl) {
+        if (nw <= 0.004f || nh <= 0.008f) return false;
         float sum = 0f;
         for (int ty = 0; ty < TPL_H; ty++) {
             int py = Math.min(ANA_H - 1, Math.max(0, (int) Math.floor((ny + (ty + 0.5f) / TPL_H * nh) * ANA_H)));
             int row = py * ANA_W;
+            int outRow = ty * TPL_W;
             for (int tx = 0; tx < TPL_W; tx++) {
                 int px = Math.min(ANA_W - 1, Math.max(0, (int) Math.floor((nx + (tx + 0.5f) / TPL_W * nw) * ANA_W)));
                 int argb = pixels[row + px];
-                int r = (argb >> 16) & 0xFF;
-                int g = (argb >> 8) & 0xFF;
-                int b = argb & 0xFF;
-                float lum = 0.299f * r + 0.587f * g + 0.114f * b;
-                tpl[ty * TPL_W + tx] = lum;
+                float lum = 0.299f * ((argb >> 16) & 0xFF) + 0.587f * ((argb >> 8) & 0xFF) + 0.114f * (argb & 0xFF);
+                tpl[outRow + tx] = lum;
                 sum += lum;
             }
         }
         float mean = sum / tpl.length;
         float normSq = 0f;
         for (int i = 0; i < tpl.length; i++) {
-            tpl[i] -= mean;
-            normSq += tpl[i] * tpl[i];
+            float v = tpl[i] - mean;
+            tpl[i] = v;
+            normSq += v * v;
         }
         float norm = (float) Math.sqrt(normSq);
         if (norm < 1e-3f) norm = 1f;
+        float invNorm = 1f / norm;
         for (int i = 0; i < tpl.length; i++) {
-            tpl[i] /= norm;
+            tpl[i] *= invNorm;
         }
-        return tpl;
+        return true;
     }
 
-    private float[] searchTemplate(int[] pixels, float[] tpl, float predX, float predY, float w, float h, float minCorr) {
+    private boolean searchTemplateZeroAlloc(
+            int[] pixels, float[] tpl, float predX, float predY, float w, float h,
+            float minCorr, float[] scratch, float[] outXY) {
         float cx = predX + w * 0.5f;
         float cy = predY + h * 0.5f;
-        float stepX = Math.max(0.008f, w * 0.14f);
-        float stepY = Math.max(0.008f, h * 0.14f);
+        float coarseStepX = Math.max(0.012f, w * 0.22f);
+        float coarseStepY = Math.max(0.012f, h * 0.22f);
 
         float bestScore = -1f;
-        float bestNx = 0f, bestNy = 0f;
+        float bestNx = predX, bestNy = predY;
         boolean found = false;
 
-        for (int dy = -2; dy <= 2; dy++) {
-            for (int dx = -2; dx <= 2; dx++) {
-                float candX = cx + dx * stepX - w * 0.5f;
-                float candY = cy + dy * stepY - h * 0.5f;
+        // 1. Kaba 3x3 arama
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                float candX = cx + dx * coarseStepX - w * 0.5f;
+                float candY = cy + dy * coarseStepY - h * 0.5f;
                 if (candX < -0.05f || candY < -0.05f || candX + w > 1.05f || candY + h > 1.05f) continue;
-
-                float[] cand = extractTemplate(pixels, candX, candY, w, h);
-                if (cand == null) continue;
+                if (!extractTemplateInto(pixels, candX, candY, w, h, scratch)) continue;
                 float dot = 0f;
-                for (int i = 0; i < tpl.length; i++) dot += tpl[i] * cand[i];
+                for (int i = 0; i < tpl.length; i++) dot += tpl[i] * scratch[i];
                 if (dot > bestScore) {
                     bestScore = dot;
                     bestNx = candX;
@@ -1146,7 +1758,36 @@ public class PersonDetectorEngine {
                 }
             }
         }
-        return (found && bestScore > minCorr) ? new float[]{bestNx, bestNy} : null;
+        if (!found) return false;
+
+        // 2. İnce 3x3 iyileştirme (toplam maks 18 değerlendirme, 0 bellek tahsisi)
+        float fineStepX = coarseStepX * 0.45f;
+        float fineStepY = coarseStepY * 0.45f;
+        float refX = bestNx;
+        float refY = bestNy;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                float candX = refX + dx * fineStepX;
+                float candY = refY + dy * fineStepY;
+                if (candX < -0.05f || candY < -0.05f || candX + w > 1.05f || candY + h > 1.05f) continue;
+                if (!extractTemplateInto(pixels, candX, candY, w, h, scratch)) continue;
+                float dot = 0f;
+                for (int i = 0; i < tpl.length; i++) dot += tpl[i] * scratch[i];
+                if (dot > bestScore) {
+                    bestScore = dot;
+                    bestNx = candX;
+                    bestNy = candY;
+                }
+            }
+        }
+
+        if (bestScore > minCorr) {
+            outXY[0] = bestNx;
+            outXY[1] = bestNy;
+            return true;
+        }
+        return false;
     }
 
     private float computeIoU(float x1, float y1, float w1, float h1, float x2, float y2, float w2, float h2) {
@@ -1167,6 +1808,7 @@ public class PersonDetectorEngine {
 
     private void copyInto(LockedState src, LockedState dst) {
         dst.id = src.id;
+        dst.name = src.name;
         dst.nx = src.nx;
         dst.ny = src.ny;
         dst.nw = src.nw;
@@ -1180,6 +1822,11 @@ public class PersonDetectorEngine {
         dst.lastUpdate = src.lastUpdate;
         dst.recoverStreak = src.recoverStreak;
         dst.memoryCount = (src.gallery != null) ? src.gallery.size() : src.memoryCount;
+        dst.deepCount = (src.deepGallery != null) ? src.deepGallery.size() : src.deepCount;
+        dst.faceCount = (src.faceGallery != null) ? src.faceGallery.size() : src.faceCount;
+        dst.hasDeepAi = dst.deepCount > 0;
+        dst.hasFaceAi = dst.faceCount > 0;
+        dst.needsImmediateNeural = src.needsImmediateNeural;
         dst.isOccluded = src.isOccluded;
         dst.lost = src.lost;
     }
@@ -1199,6 +1846,17 @@ public class PersonDetectorEngine {
                 if (detector != null) detector.close();
             } catch (Exception ignored) {}
             detector = null;
+            if (neuralEngine != null) {
+                neuralEngine.close();
+            }
         }
+        List<PersonMemoryStore.PersonProfile> finalSnap;
+        int finalNextId;
+        synchronized (stateLock) {
+            finalSnap = snapshotRoomMemoryLocked();
+            finalNextId = nextTrackId;
+            memoryDirty = false;
+        }
+        memoryStore.close(finalSnap, finalNextId);
     }
 }
