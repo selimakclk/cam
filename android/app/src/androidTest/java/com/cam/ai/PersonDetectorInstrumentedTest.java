@@ -547,4 +547,51 @@ public class PersonDetectorInstrumentedTest {
             if (memFile.exists()) memFile.delete();
         }
     }
+
+    @Test
+    public void testZeroPingLongPollWakeupAndSilentPhone() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        // 1. Telefon ses motoru tamamen sessiz (AudioTrack/Vibrator acmadan) calismali
+        SirenAudioEngine silent = new SirenAudioEngine(ctx);
+        silent.playLockBeep();
+        silent.playErrorBeep();
+        silent.startAlarm();
+        assertTrue(silent.isAlarmActive());
+        silent.stopAlarm();
+        assertFalse(silent.isAlarmActive());
+        silent.release();
+
+        // 2. Uzun beklemeli /state?wait=1&alarm=0 alarm degistigi milisaniyede uyanmali
+        CameraStreamServer server = new CameraStreamServer(18082, "54321");
+        server.start();
+        try {
+            server.updateAiState(480, 640, false, false, java.util.Collections.emptyList(), null);
+            assertFalse("Sadece state okunurken video akisi acik gorunmemeli", server.hasActiveVideoStream());
+
+            final long[] elapsedMs = new long[1];
+            final String[] respHolder = new String[1];
+            Thread waiter = new Thread(() -> {
+                long t0 = System.currentTimeMillis();
+                try {
+                    respHolder[0] = httpGet("http://127.0.0.1:18082/state?code=54321&wait=1&alarm=0");
+                } catch (Exception ignored) {}
+                elapsedMs[0] = System.currentTimeMillis() - t0;
+            });
+            waiter.start();
+
+            Thread.sleep(220);
+            PersonDetectorEngine.LockedState lostLocked = new PersonDetectorEngine.LockedState();
+            lostLocked.id = 1;
+            lostLocked.lost = true;
+            server.updateAiState(480, 640, false, true, java.util.Collections.emptyList(), lostLocked);
+            waiter.join(1500);
+
+            assertNotNull("Uzun bekleme yaniti gelmeli", respHolder[0]);
+            assertTrue("Alarm degisince aninda uyanmali (2400ms beklenmemeli), sure=" + elapsedMs[0],
+                    elapsedMs[0] >= 180 && elapsedMs[0] < 1200);
+            assertTrue("Yanitta alarm:true olmali", respHolder[0].contains("\"alarm\":true"));
+        } finally {
+            server.stop();
+        }
+    }
 }

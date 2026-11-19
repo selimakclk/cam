@@ -45,15 +45,22 @@ public class CameraStreamServer extends NanoHTTPD {
     private final Object frameLock = new Object();
 
     private volatile String latestStateJson = "{\"w\":480,\"h\":640,\"front\":false,\"alarm\":false,\"persons\":[],\"locked\":null}";
+    private final Object stateSyncLock = new Object();
+    private volatile boolean latestAlertFlag = false;
     private OnRemoteCommandListener commandListener;
 
     private volatile boolean running = false;
     private Thread udpBroadcastThread;
     private final AtomicInteger activeStreamClients = new AtomicInteger(0);
     private volatile long lastViewerActivityTs = 0L;
+    private volatile long lastSingleFrameTs = 0L;
 
     public boolean hasActiveViewer() {
-        return activeStreamClients.get() > 0 || (System.currentTimeMillis() - lastViewerActivityTs < 4000L);
+        return activeStreamClients.get() > 0 || (System.currentTimeMillis() - lastViewerActivityTs < 6500L);
+    }
+
+    public boolean hasActiveVideoStream() {
+        return activeStreamClients.get() > 0 || (System.currentTimeMillis() - lastSingleFrameTs < 3000L);
     }
 
     public CameraStreamServer(int port, String roomCode) {
@@ -87,6 +94,9 @@ public class CameraStreamServer extends NanoHTTPD {
         }
         synchronized (frameLock) {
             frameLock.notifyAll();
+        }
+        synchronized (stateSyncLock) {
+            stateSyncLock.notifyAll();
         }
         super.stop();
     }
@@ -144,7 +154,16 @@ public class CameraStreamServer extends NanoHTTPD {
             } else {
                 root.put("locked", JSONObject.NULL);
             }
-            latestStateJson = root.toString();
+            boolean alertNow = alarmActive || (locked != null && locked.lost);
+            String jsonStr = root.toString();
+            synchronized (stateSyncLock) {
+                boolean alertChanged = (alertNow != latestAlertFlag);
+                latestAlertFlag = alertNow;
+                latestStateJson = jsonStr;
+                if (alertChanged) {
+                    stateSyncLock.notifyAll();
+                }
+            }
         } catch (Exception ignored) {}
     }
 
@@ -164,6 +183,23 @@ public class CameraStreamServer extends NanoHTTPD {
 
         if ("/state".equals(uri)) {
             lastViewerActivityTs = System.currentTimeMillis();
+            // Oyun içi 0-ping uzun bekleme modu (?wait=1&alarm=0|1): alarm değişene kadar ağda 0 paket gider, değişince <1ms uyanır!
+            if ("1".equals(session.getParms().get("wait"))) {
+                boolean clientAlert = "1".equals(session.getParms().get("alarm"));
+                long deadline = System.currentTimeMillis() + 2400L;
+                synchronized (stateSyncLock) {
+                    while (running && latestAlertFlag == clientAlert) {
+                        long rem = deadline - System.currentTimeMillis();
+                        if (rem <= 0) break;
+                        try {
+                            stateSyncLock.wait(rem);
+                        } catch (InterruptedException e) {
+                            break;
+                        }
+                    }
+                }
+                lastViewerActivityTs = System.currentTimeMillis();
+            }
             return newFixedLengthResponse(Response.Status.OK, "application/json", latestStateJson);
         }
 
@@ -199,7 +235,9 @@ public class CameraStreamServer extends NanoHTTPD {
         }
 
         if ("/frame.jpg".equals(uri)) {
-            lastViewerActivityTs = System.currentTimeMillis();
+            long now = System.currentTimeMillis();
+            lastViewerActivityTs = now;
+            lastSingleFrameTs = now;
             byte[] snap = latestJpeg;
             if (snap == null) {
                 return newFixedLengthResponse(Response.Status.NO_CONTENT, MIME_PLAINTEXT, "");
@@ -269,43 +307,46 @@ public class CameraStreamServer extends NanoHTTPD {
                 String safeModel = (Build.MODEL != null ? Build.MODEL : "Android").replace("|", " ");
                 while (running && !Thread.currentThread().isInterrupted()) {
                     try {
-                        List<String> myIps = getAllLocalIpv4Addresses();
-                        if (!myIps.isEmpty()) {
-                            List<InetAddress> targets = new ArrayList<>();
-                            try {
-                                targets.add(InetAddress.getByName("255.255.255.255"));
-                            } catch (Exception ignored) {}
+                        // İzleyici zaten bağlıysa Wi-Fi broadcast gönderme (oyun ping jitter'ını sıfırlar!)
+                        if (!hasActiveViewer()) {
+                            List<String> myIps = getAllLocalIpv4Addresses();
+                            if (!myIps.isEmpty()) {
+                                List<InetAddress> targets = new ArrayList<>();
+                                try {
+                                    targets.add(InetAddress.getByName("255.255.255.255"));
+                                } catch (Exception ignored) {}
 
-                            for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                                if (nif.isLoopback() || !nif.isUp()) continue;
-                                for (InterfaceAddress ia : nif.getInterfaceAddresses()) {
-                                    InetAddress bcast = ia.getBroadcast();
-                                    if (bcast != null) targets.add(bcast);
+                                for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                                    if (nif.isLoopback() || !nif.isUp()) continue;
+                                    for (InterfaceAddress ia : nif.getInterfaceAddresses()) {
+                                        InetAddress bcast = ia.getBroadcast();
+                                        if (bcast != null) targets.add(bcast);
+                                    }
                                 }
-                            }
 
-                            for (String ip : myIps) {
-                                int dot = ip.lastIndexOf('.');
-                                if (dot > 0) {
-                                    try {
-                                        InetAddress subBcast = InetAddress.getByName(ip.substring(0, dot + 1) + "255");
-                                        if (!targets.contains(subBcast)) targets.add(subBcast);
-                                    } catch (Exception ignored) {}
+                                for (String ip : myIps) {
+                                    int dot = ip.lastIndexOf('.');
+                                    if (dot > 0) {
+                                        try {
+                                            InetAddress subBcast = InetAddress.getByName(ip.substring(0, dot + 1) + "255");
+                                            if (!targets.contains(subBcast)) targets.add(subBcast);
+                                        } catch (Exception ignored) {}
+                                    }
                                 }
-                            }
 
-                            for (String ip : myIps) {
-                                String msg = "CAMPRO|" + roomCode + "|" + ip + "|" + port + "|" + safeModel;
-                                byte[] data = msg.getBytes(StandardCharsets.UTF_8);
-                                for (InetAddress bcast : targets) {
-                                    try {
-                                        socket.send(new DatagramPacket(data, data.length, bcast, DISCOVERY_UDP_PORT));
-                                    } catch (Exception ignored) {}
+                                for (String ip : myIps) {
+                                    String msg = "CAMPRO|" + roomCode + "|" + ip + "|" + port + "|" + safeModel;
+                                    byte[] data = msg.getBytes(StandardCharsets.UTF_8);
+                                    for (InetAddress bcast : targets) {
+                                        try {
+                                            socket.send(new DatagramPacket(data, data.length, bcast, DISCOVERY_UDP_PORT));
+                                        } catch (Exception ignored) {}
+                                    }
                                 }
                             }
                         }
                     } catch (Exception ignored) {}
-                    Thread.sleep(700);
+                    Thread.sleep(hasActiveViewer() ? 1500 : 800);
                 }
             } catch (Exception e) {
                 Log.w(TAG, "UDP yayın durduruldu: " + e.getMessage());

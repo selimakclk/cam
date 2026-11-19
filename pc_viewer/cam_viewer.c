@@ -145,6 +145,7 @@ static char g_toast_utf8[128] = {0};
 static DWORD g_toast_until = 0;
 
 static volatile SOCKET g_video_sock = INVALID_SOCKET;
+static volatile SOCKET g_state_sock = INVALID_SOCKET;
 static HANDLE g_video_wake_ev = NULL;
 static HANDLE g_audio_wake_ev = NULL;
 static HANDLE g_state_wake_ev = NULL;
@@ -300,27 +301,34 @@ static SOCKET connect_tcp_timeout(const char *ip, int port, int timeout_ms) {
     return s;
 }
 
-static int http_get_simple(const char *ip, int port, const char *path, int timeout_ms,
-                           char *out_body, int out_cap, int *out_body_len) {
+static int http_get_ex(const char *ip, int port, const char *path, int timeout_ms,
+                       char *out_body, int out_cap, int *out_body_len, volatile SOCKET *cancel_slot) {
     if (out_body && out_cap > 0) out_body[0] = 0;
     if (out_body_len) *out_body_len = 0;
 
-    SOCKET s = connect_tcp_timeout(ip, port, timeout_ms);
+    SOCKET s = connect_tcp_timeout(ip, port, timeout_ms < 1200 ? timeout_ms : 1200);
     if (s == INVALID_SOCKET) return -1;
+    DWORD rto = (DWORD)timeout_ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rto, sizeof(rto));
+    if (cancel_slot) InterlockedExchangePointer((PVOID *)cancel_slot, (PVOID)s);
 
     char req[512];
     int req_len = _snprintf(req, sizeof(req) - 1,
-        "GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\nUser-Agent: CamViewerC/2.2\r\n\r\n",
+        "GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\nUser-Agent: CamViewerC/2.3\r\n\r\n",
         path, ip, port);
     if (req_len <= 0 || send(s, req, req_len, 0) != req_len) {
+        if (cancel_slot) InterlockedCompareExchangePointer((PVOID *)cancel_slot, (PVOID)INVALID_SOCKET, (PVOID)s);
         closesocket(s);
         return -1;
     }
 
-    /* Yanıtı oku (başlık + gövde) */
     int buf_cap = (out_cap > 0 ? out_cap : 1024) + 1024;
     char *raw = (char *)malloc((size_t)buf_cap);
-    if (!raw) { closesocket(s); return -1; }
+    if (!raw) {
+        if (cancel_slot) InterlockedCompareExchangePointer((PVOID *)cancel_slot, (PVOID)INVALID_SOCKET, (PVOID)s);
+        closesocket(s);
+        return -1;
+    }
     int total = 0;
     while (total < buf_cap - 1) {
         int n = recv(s, raw + total, buf_cap - 1 - total, 0);
@@ -328,6 +336,7 @@ static int http_get_simple(const char *ip, int port, const char *path, int timeo
         total += n;
     }
     raw[total] = 0;
+    if (cancel_slot) InterlockedCompareExchangePointer((PVOID *)cancel_slot, (PVOID)INVALID_SOCKET, (PVOID)s);
     closesocket(s);
 
     int status = -1;
@@ -347,6 +356,11 @@ static int http_get_simple(const char *ip, int port, const char *path, int timeo
     }
     free(raw);
     return status;
+}
+
+static int http_get_simple(const char *ip, int port, const char *path, int timeout_ms,
+                           char *out_body, int out_cap, int *out_body_len) {
+    return http_get_ex(ip, port, path, timeout_ms, out_body, out_cap, out_body_len, NULL);
 }
 
 /* ==================== HAFİF & GÜVENLİ C JSON AYRIŞTIRICI ==================== */
@@ -775,19 +789,21 @@ static int scan_subnet_fast(const char *code, char *out_ip, int *out_port, char 
     }
     free(addrs);
 
-    /* Non-blocking paralel TCP port 8080 taraması (32'li partiler) */
+    /* Yumuşak paralel TCP port 8080 taraması (12'li partiler + ara nefes -> router ping'i yükseltmez) */
     for (int pi = 0; pi < pcount; pi++) {
-        for (int base = 1; base <= 254; base += 32) {
-            if (!InterlockedCompareExchange(&g_running, 0, 0) || InterlockedCompareExchange(&g_reconnect_req, 0, 0))
+        for (int base = 1; base <= 254; base += 12) {
+            if (!InterlockedCompareExchange(&g_running, 0, 0)
+                || InterlockedCompareExchange(&g_reconnect_req, 0, 0)
+                || !InterlockedCompareExchange(&g_window_active, 0, 0))
                 return 0;
 
-            SOCKET socks[32];
-            uint32_t ips[32];
+            SOCKET socks[12];
+            uint32_t ips[12];
             int sc = 0;
             fd_set wfds;
             FD_ZERO(&wfds);
 
-            for (int j = 0; j < 32 && (base + j) <= 254; j++) {
+            for (int j = 0; j < 12 && (base + j) <= 254; j++) {
                 uint32_t host_ip = prefixes[pi] | (uint32_t)(base + j);
                 SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 if (s == INVALID_SOCKET) continue;
@@ -847,6 +863,37 @@ static void stop_active_video_socket(void) {
     if (s != INVALID_SOCKET) {
         shutdown(s, SD_BOTH);
         closesocket(s);
+    }
+}
+
+static void stop_active_state_socket(void) {
+    SOCKET s = (SOCKET)InterlockedExchangePointer((PVOID *)&g_state_sock, (PVOID)INVALID_SOCKET);
+    if (s != INVALID_SOCKET) {
+        shutdown(s, SD_BOTH);
+    }
+}
+
+/* Windows EcoQoS (Verimlilik Modu) + IDLE öncelik -> oyundaki FPS'ye %0.0 etki! */
+static void apply_gaming_eco_qos(int enable_eco) {
+    SetPriorityClass(GetCurrentProcess(), enable_eco ? IDLE_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
+    if (g_th_state) {
+        SetThreadPriority(g_th_state, enable_eco ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_NORMAL);
+    }
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (k32) {
+        typedef BOOL(WINAPI *SetProcInfoFn)(HANDLE, int, LPVOID, DWORD);
+        SetProcInfoFn fn = (SetProcInfoFn)GetProcAddress(k32, "SetProcessInformation");
+        if (fn) {
+            struct {
+                ULONG Version;
+                ULONG ControlMask;
+                ULONG StateMask;
+            } pts;
+            pts.Version = 1; /* PROCESS_POWER_THROTTLING_CURRENT_VERSION */
+            pts.ControlMask = 0x1; /* PROCESS_POWER_THROTTLING_EXECUTION_SPEED */
+            pts.StateMask = enable_eco ? 0x1 : 0x0;
+            fn(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &pts, sizeof(pts));
+        }
     }
 }
 
@@ -923,8 +970,8 @@ static DWORD WINAPI state_thread_proc(LPVOID unused) {
             }
         }
 
-        /* 4. Yerel alt ağ paralel tarama (hotspot / router UDP engellerse) */
-        if (!connected_ok && !wrong_code && !manual_ip[0]) {
+        /* 4. Yerel alt ağ taraması: SADECE pencere öndeyken çalışır (oyundayken ASLA alt ağ tarayıp ping yükseltmez!) */
+        if (!connected_ok && !wrong_code && !manual_ip[0] && InterlockedCompareExchange(&g_window_active, 0, 0)) {
             set_conn_status("Yerel ağ taranıyor...");
             if (scan_subnet_fast(code, found_ip, &found_port, found_model, &wrong_code)) {
                 connected_ok = 1;
@@ -941,7 +988,8 @@ static DWORD WINAPI state_thread_proc(LPVOID unused) {
         }
         if (!connected_ok) {
             set_conn_status("Kamera bulunamadı — Tekrar aranıyor...");
-            WaitForSingleObject(g_state_wake_ev, 1200);
+            /* Oyundayken 4 saniye bekle (sıfır ağ yükü), öndeyken 1.2 saniye */
+            WaitForSingleObject(g_state_wake_ev, InterlockedCompareExchange(&g_window_active, 0, 0) ? 1200 : 4000);
             continue;
         }
 
@@ -963,15 +1011,41 @@ static DWORD WINAPI state_thread_proc(LPVOID unused) {
         _snprintf(ok_msg, sizeof(ok_msg) - 1, "Bağlı • %s (%s)", found_model, found_ip);
         set_conn_status(ok_msg);
 
-        /* Sürekli düşük-yük /state kontrol döngüsü */
-        char state_path[64];
-        _snprintf(state_path, sizeof(state_path) - 1, "/state?code=%s", code);
+        /* Sürekli sıfır-ping /state kontrol döngüsü (oyundayken uzun-beklemeli itme: ~80 bayt/sn!) */
+        char state_path[96];
         int fail_streak = 0;
 
         while (InterlockedCompareExchange(&g_running, 0, 0)
                && !InterlockedCompareExchange(&g_reconnect_req, 0, 0)) {
+            /* Tam ekran oyunlar WM_ACTIVATE göndermese bile ön-plan kontrolüyle 0-yük uykuyu garanti et */
+            if (g_hwnd) {
+                int fg_now = (!IsIconic(g_hwnd) && IsWindowVisible(g_hwnd) && GetForegroundWindow() == g_hwnd) ? 1 : 0;
+                if (fg_now != (int)InterlockedCompareExchange(&g_window_active, 0, 0)) {
+                    set_window_active_state(g_hwnd, fg_now);
+                }
+            }
+
+            int is_active = (int)InterlockedCompareExchange(&g_window_active, 0, 0);
+            int timeout_ms;
+            if (is_active) {
+                _snprintf(state_path, sizeof(state_path) - 1, "/state?code=%s", code);
+                timeout_ms = 1000;
+            } else {
+                /* Oyundayken telefona wait=1&alarm=X gönder: 2.4sn boyunca ağda 0 paket gider, alarm değişince <1ms uyanır! */
+                _snprintf(state_path, sizeof(state_path) - 1, "/state?code=%s&wait=1&alarm=%d", code, prev_target_lost ? 1 : 0);
+                timeout_ms = 3800;
+            }
+
+            DWORD t_req0 = GetTickCount();
             int blen = 0;
-            int st = http_get_simple(found_ip, found_port, state_path, 900, state_body, sizeof(state_body), &blen);
+            int st = http_get_ex(found_ip, found_port, state_path, timeout_ms, state_body, sizeof(state_body), &blen, &g_state_sock);
+            DWORD req_elapsed = GetTickCount() - t_req0;
+
+            /* Alt+Tab ile öne geçerken uzun-bekleme iptal edildiyse hata sayma */
+            if (st < 0 && (int)InterlockedCompareExchange(&g_window_active, 0, 0) != is_active) {
+                continue;
+            }
+
             if (st == 200 && blen > 2) {
                 fail_streak = 0;
                 AiState parsed;
@@ -982,6 +1056,7 @@ static DWORD WINAPI state_thread_proc(LPVOID unused) {
 
                     /* Yalnızca kilitli hedef kaybolduğunda (alarm=true veya locked.lost=true) bip-bip! */
                     int target_lost_now = (parsed.locked.valid && parsed.locked.lost) || (parsed.locked.valid && parsed.alarm);
+                    int alarm_changed = (target_lost_now != prev_target_lost);
                     if (target_lost_now && !prev_target_lost) {
                         InterlockedExchange(&g_muted_current_alarm, 0);
                         InterlockedExchange(&g_alarm_beeping, 1);
@@ -998,7 +1073,10 @@ static DWORD WINAPI state_thread_proc(LPVOID unused) {
                     }
                     prev_target_lost = target_lost_now;
 
-                    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_STATE_UPD, 0, 0);
+                    /* Oyundayken UI thread'ini ASLA uyandırma (0 DWM / 0 GDI / 0 FPS etki!) */
+                    if (g_hwnd && (InterlockedCompareExchange(&g_window_active, 0, 0) || alarm_changed)) {
+                        PostMessageW(g_hwnd, WM_APP_STATE_UPD, 0, 0);
+                    }
                 }
             } else if (st == 403) {
                 set_conn_status("Şifre değişti / hatalı!");
@@ -1011,17 +1089,14 @@ static DWORD WINAPI state_thread_proc(LPVOID unused) {
                 }
             }
 
-            /* Tam ekran oyunlar WM_ACTIVATE göndermese bile ön-plan kontrolüyle 0-yük uykuyu garanti et */
-            if (g_hwnd) {
-                int fg_now = (!IsIconic(g_hwnd) && IsWindowVisible(g_hwnd) && GetForegroundWindow() == g_hwnd) ? 1 : 0;
-                if (fg_now != (int)InterlockedCompareExchange(&g_window_active, 0, 0)) {
-                    set_window_active_state(g_hwnd, fg_now);
-                }
+            if (InterlockedCompareExchange(&g_window_active, 0, 0)) {
+                WaitForSingleObject(g_state_wake_ev, 180);
+            } else {
+                /* v2.3 telefon uzun-bekleme destekliyorsa (req_elapsed >= 400ms) hemen sessiz beklemeye dön;
+                   eski telefon hemen yanıt döndüyse 650ms uyu ki ping'e sıfır etki olsun */
+                DWORD sleep_ms = (req_elapsed < 400) ? 650 : 60;
+                WaitForSingleObject(g_state_wake_ev, sleep_ms);
             }
-
-            /* Öndeyken 180ms, oyundayken (uyku) 280ms -> CPU ~%0.0 */
-            DWORD poll_ms = InterlockedCompareExchange(&g_window_active, 0, 0) ? 180 : 280;
-            WaitForSingleObject(g_state_wake_ev, poll_ms);
         }
     }
     return 0;
@@ -1241,17 +1316,27 @@ static DWORD WINAPI video_thread_proc(LPVOID unused) {
     CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
                      &IID_IWICImagingFactory, (void **)&wic);
 
-    int jpeg_cap = 131072;
-    BYTE *jpeg_buf = (BYTE *)malloc((size_t)jpeg_cap);
+    int jpeg_cap = 0;
+    BYTE *jpeg_buf = NULL;
     int stream_fails = 0;
 
     while (InterlockedCompareExchange(&g_running, 0, 0)) {
-        /* 0-YÜK UYKU MODU: Bağlı değilsek VEYA pencere arka plandaysa (oyundayken) TAMAMEN UYU! */
+        /* 0-YÜK UYKU MODU: Bağlı değilsek VEYA pencere arka plandaysa (oyundayken) TAMAMEN UYU ve tamponu boşalt! */
         if (!InterlockedCompareExchange(&g_connected, 0, 0)
             || !InterlockedCompareExchange(&g_window_active, 0, 0)) {
             stop_active_video_socket();
+            if (jpeg_buf) {
+                free(jpeg_buf);
+                jpeg_buf = NULL;
+                jpeg_cap = 0;
+            }
             WaitForSingleObject(g_video_wake_ev, INFINITE);
             continue;
+        }
+        if (!jpeg_buf) {
+            jpeg_cap = 131072;
+            jpeg_buf = (BYTE *)malloc((size_t)jpeg_cap);
+            if (!jpeg_buf) { WaitForSingleObject(g_video_wake_ev, 200); continue; }
         }
 
         char ip[64], code[16];
@@ -1662,30 +1747,35 @@ static void release_sleep_buffers(void) {
 static void set_window_active_state(HWND hwnd, int is_active) {
     LONG prev = InterlockedExchange(&g_window_active, is_active ? 1 : 0);
     if (prev != (is_active ? 1 : 0)) {
+        apply_gaming_eco_qos(!is_active);
         if (is_active) {
+            stop_active_state_socket(); /* Uzun-beklemeden hemen çık -> Alt+Tab'da anlık durum yenile! */
             SetEvent(g_video_wake_ev);
             SetEvent(g_state_wake_ev);
-            InvalidateRect(hwnd, NULL, FALSE);
+            if (GetCurrentThreadId() == GetWindowThreadProcessId(hwnd, NULL)) {
+                update_status_bar_text();
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (hwnd) {
+                PostMessageW(hwnd, WM_APP_CONN_UPD, 0, 0);
+            }
         } else {
-            /* Oyuna / arka plana geçildi -> video soketini kapat, piksel/GDI tamponlarını boşalt, RAM'i buda! */
+            /* Oyuna / arka plana geçildi -> video soketini kapat, zamanlayıcı & tamponları temizle, EcoQoS + RAM buda! */
             stop_active_video_socket();
             release_sleep_buffers();
-            if (g_mem_dc && GetCurrentThreadId() == GetWindowThreadProcessId(hwnd, NULL)) {
-                SelectObject(g_mem_dc, g_mem_old);
-                DeleteObject(g_mem_bmp);
-                DeleteDC(g_mem_dc);
-                g_mem_dc = NULL;
-                g_mem_bmp = NULL;
-                g_mem_old = NULL;
-                g_mem_w = 0;
-                g_mem_h = 0;
+            if (GetCurrentThreadId() == GetWindowThreadProcessId(hwnd, NULL)) {
+                g_ring_start = 0;
+                KillTimer(hwnd, TIMER_PULSE_ID);
+                if (g_mem_dc) {
+                    SelectObject(g_mem_dc, g_mem_old);
+                    DeleteObject(g_mem_bmp);
+                    DeleteDC(g_mem_dc);
+                    g_mem_dc = NULL; g_mem_bmp = NULL; g_mem_old = NULL;
+                    g_mem_w = 0; g_mem_h = 0;
+                }
+                SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+            } else if (hwnd) {
+                PostMessageW(hwnd, WM_APP_CONN_UPD, 0, 0);
             }
-            SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-        }
-        if (GetCurrentThreadId() == GetWindowThreadProcessId(hwnd, NULL)) {
-            update_status_bar_text();
-        } else if (hwnd) {
-            PostMessageW(hwnd, WM_APP_CONN_UPD, 0, 0);
         }
     }
 }
@@ -1827,6 +1917,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             InterlockedExchange(&g_reconnect_req, 1);
             SetEvent(g_state_wake_ev);
             stop_active_video_socket();
+            stop_active_state_socket();
         } else if (id == IDC_BTN_UNLOCK) {
             send_remote_cmd_async("action=unlock", 0);
             InterlockedExchange(&g_alarm_beeping, 0);
@@ -1890,8 +1981,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
     case WM_APP_STATE_UPD:
     case WM_APP_CONN_UPD: {
-        update_status_bar_text();
         if (InterlockedCompareExchange(&g_window_active, 0, 0)) {
+            update_status_bar_text();
             RECT cr; GetClientRect(hwnd, &cr);
             cr.top = TOP_BAR_H; cr.bottom -= BOT_BAR_H;
             InvalidateRect(hwnd, &cr, FALSE);
@@ -1978,6 +2069,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         InterlockedExchange(&g_running, 0);
         InterlockedExchange(&g_alarm_beeping, 0);
         stop_active_video_socket();
+        stop_active_state_socket();
         if (g_video_wake_ev) SetEvent(g_video_wake_ev);
         if (g_audio_wake_ev) SetEvent(g_audio_wake_ev);
         if (g_state_wake_ev) SetEvent(g_state_wake_ev);

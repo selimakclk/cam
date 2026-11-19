@@ -481,10 +481,10 @@ public class MainActivity extends AppCompatActivity {
             int bh = upright.getHeight();
             overlayView.setSourceInfo(bw, bh, isFrontCamera);
 
-            // 1. Sadece aktif izleyici bağlıyken JPEG kare sıkıştır
+            // 1. Yalnızca aktif video akışı isteyen izleyici varken JPEG sıkıştır (PC oyun uykusundayken 0 JPEG yükü!)
             frameCounter++;
-            final boolean hasViewer = (streamServer != null && streamServer.hasActiveViewer());
-            if (hasViewer && frameCounter % 2 == 0) {
+            final boolean hasVideoViewer = (streamServer != null && streamServer.hasActiveVideoStream());
+            if (hasVideoViewer && frameCounter % 2 == 0) {
                 reusableJpegOut.reset();
                 upright.compress(Bitmap.CompressFormat.JPEG, 55, reusableJpegOut);
                 streamServer.updateFrame(reusableJpegOut.toByteArray());
@@ -794,11 +794,14 @@ public class MainActivity extends AppCompatActivity {
         btnTorch.setTextColor(isTorchOn ? 0xFFFFD60A : 0xFFFFFFFF);
     }
 
-    // =================== ALARM YÖNETİMİ ===================
+    // =================== ALARM YÖNETİMİ (TELEFON TAMAMEN SESSİZ) ===================
     private void triggerAlarm() {
         if (isAlarmShowing) return;
         isAlarmShowing = true;
-        alarmOverlay.setVisibility(View.VISIBLE);
+        // Gizli OLED karartma açıkken ekran siyah kalır; açık ekranda görsel uyarı görünür; SES KESİNLİKLE ÇIKMAZ.
+        if (!isStealthActive) {
+            alarmOverlay.setVisibility(View.VISIBLE);
+        }
         if (sirenEngine != null) sirenEngine.startAlarm();
     }
 
