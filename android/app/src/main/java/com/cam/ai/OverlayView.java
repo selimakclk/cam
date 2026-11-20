@@ -307,10 +307,23 @@ public class OverlayView extends View {
                 fillScreenRect(lerpNx, lerpNy, lerpNw, lerpNh, front, tempRect);
                 int pct = Math.round(snapLocked.score * 100f);
                 boolean hasCustomName = (snapLocked.name != null && !snapLocked.name.trim().isEmpty());
-                String aiBadge = snapLocked.hasFaceAi ? " • Yüz+AI" : (snapLocked.hasDeepAi ? " • AI" : "");
+                String aiBadge;
+                if (snapLocked.hasFaceAi && snapLocked.hasDeepAi) {
+                    aiBadge = " • Pro AI";
+                } else if (snapLocked.hasDeepAi) {
+                    aiBadge = " • OSNet";
+                } else if (snapLocked.hasFaceAi) {
+                    aiBadge = " • Yüz";
+                } else {
+                    aiBadge = "";
+                }
                 String label;
                 if (snapLocked.lost) {
                     label = hasCustomName ? ("KAYIP: " + snapLocked.name.trim() + "!") : "HEDEF KAYIP!";
+                } else if (snapLocked.isOccluded) {
+                    label = hasCustomName
+                            ? ("BEKLENİYOR • " + snapLocked.name.trim() + aiBadge)
+                            : ("BEKLENİYOR #" + snapLocked.id + aiBadge);
                 } else {
                     label = hasCustomName
                             ? ("KİLİTLİ • " + snapLocked.name.trim() + " • %" + pct + aiBadge)
@@ -325,7 +338,11 @@ public class OverlayView extends View {
                     fillScreenRect(p.nx, p.ny, p.nw, p.nh, front, tempRect);
                     int pct = Math.round(p.score * 100f);
                     boolean named = (p.name != null && !p.name.trim().isEmpty());
-                    String badge = p.hasFaceAi ? " • Yüz" : (p.hasDeepAi ? " • AI" : "");
+                    String badge;
+                    if (p.hasFaceAi && p.hasDeepAi) badge = " • Pro AI";
+                    else if (p.hasDeepAi) badge = " • OSNet";
+                    else if (p.hasFaceAi) badge = " • Yüz";
+                    else badge = "";
                     String idleLabel = named
                             ? (p.name.trim() + " • %" + pct + badge)
                             : ("İNSAN #" + p.id + " • %" + pct + badge);

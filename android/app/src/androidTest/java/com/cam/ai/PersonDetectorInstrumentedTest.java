@@ -73,11 +73,11 @@ public class PersonDetectorInstrumentedTest {
         assertFalse(out2.targetJustLost);
         assertFalse(out2.locked.lost);
 
-        // 5. Kisi kadrajdan cikinca (bos siyah kareler + 1.2s bekleme) hedef kayip alarmi tetiklenmeli
+        // 5. Kisi kadrajdan cikinca (bos siyah kareler + 1.85s akilli gizlenme tamponu sonrasi) hedef kayip alarmi tetiklenmeli
         Bitmap emptyBmp = Bitmap.createBitmap(480, 640, Bitmap.Config.ARGB_8888);
         emptyBmp.eraseColor(Color.BLACK);
 
-        Thread.sleep(1250);
+        Thread.sleep(1900);
         PersonDetectorEngine.AnalysisOutput outLost = engine.processFrame(emptyBmp);
         assertNotNull(outLost.locked);
         assertTrue("Kisi ciktiginda targetJustLost tetiklenmeli!", outLost.targetJustLost);
@@ -208,7 +208,7 @@ public class PersonDetectorInstrumentedTest {
             Bitmap blank = Bitmap.createBitmap(480, 360, Bitmap.Config.ARGB_8888);
             blank.eraseColor(Color.BLACK);
             engine.processFrame(blank);
-            Thread.sleep(1150);
+            Thread.sleep(1900);
             PersonDetectorEngine.AnalysisOutput lostOut = engine.processFrame(blank);
             assertTrue("Kişi çıkınca kayıp uyarısı vermeli", lostOut.targetJustLost);
             assertTrue(lostOut.locked != null && lostOut.locked.lost);
@@ -371,7 +371,7 @@ public class PersonDetectorInstrumentedTest {
             Bitmap blank = Bitmap.createBitmap(480, 360, Bitmap.Config.ARGB_8888);
             blank.eraseColor(Color.BLACK);
             engine.processFrame(blank);
-            Thread.sleep(1150);
+            Thread.sleep(1900);
             PersonDetectorEngine.AnalysisOutput lostOut = engine.processFrame(blank);
             assertTrue(lostOut.locked != null && lostOut.locked.lost);
 
@@ -419,7 +419,8 @@ public class PersonDetectorInstrumentedTest {
         PersonDetectorEngine engine = new PersonDetectorEngine(ctx, memFile);
 
         try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
-            assertTrue("SSD motoru baslatilamadi", engine.isInitialized());
+            assertTrue("EfficientDet-Lite0 INT8 motoru baslatilamadi", engine.isInitialized());
+            assertTrue("OSNet MSMT17 512-D Person Re-ID hazir olmali", engine.isReidAiReady());
             assertTrue("BlazeFace + MobileFaceNet asenkron yuz AI hazir olmali", engine.isFaceAiReady());
 
             Bitmap roomBmp = BitmapFactory.decodeStream(is);
@@ -429,10 +430,11 @@ public class PersonDetectorInstrumentedTest {
             assertFalse("Odada kisi algilanmali", out.persons.isEmpty());
             assertNotNull("129-D Re-ID imzasi cikarilmali", out.persons.get(0).signature);
 
-            // Asenkron yuz AI'nin arka planda isi bitirmesini bekle ve ogrendigini dogrula
-            engine.waitForPendingFaceWork(2500);
+            // Asenkron OSNet + yuz AI'nin arka planda isi bitirmesini bekle ve ikisinin de ogrendigini dogrula
+            engine.waitForPendingIdentityWork(3000);
             PersonDetectorEngine.AnalysisOutput out2 = engine.processFrame(roomBmp);
             assertFalse(out2.persons.isEmpty());
+            assertTrue("Asenkron OSNet 512-D Re-ID ogrenilmis olmali", out2.persons.get(0).hasDeepAi);
             assertTrue("Asenkron biyometrik yuz AI ogrenilmis olmali", out2.persons.get(0).hasFaceAi);
         } finally {
             engine.close();
@@ -510,7 +512,7 @@ public class PersonDetectorInstrumentedTest {
             Bitmap blank = Bitmap.createBitmap(480, 360, Bitmap.Config.ARGB_8888);
             blank.eraseColor(Color.BLACK);
             engine.processFrame(blank);
-            Thread.sleep(1150);
+            Thread.sleep(1900);
             PersonDetectorEngine.AnalysisOutput lostOut = engine.processFrame(blank);
             assertTrue(lostOut.locked != null && lostOut.locked.lost);
 
@@ -645,5 +647,211 @@ public class PersonDetectorInstrumentedTest {
             if (act != null) act.finish();
         }
         assertFalse("Durdurulunca servis temiz kapanmali", CameraMonitorService.isRunning());
+    }
+
+    @Test
+    public void testSmartOcclusionBufferPreventsFalseAlarm() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        java.io.File memFile = new java.io.File(ctx.getCacheDir(), "test_occlusion.bin");
+        if (memFile.exists()) memFile.delete();
+        PersonDetectorEngine engine = new PersonDetectorEngine(ctx, memFile);
+
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            Bitmap roomBmp = BitmapFactory.decodeStream(is);
+            PersonDetectorEngine.AnalysisOutput out1 = engine.processFrame(roomBmp);
+            assertFalse(out1.persons.isEmpty());
+            TrackedPerson p = out1.persons.get(0);
+
+            PersonDetectorEngine.LockedState lockSnap = new PersonDetectorEngine.LockedState();
+            assertEquals(PersonDetectorEngine.LockStatus.LOCKED, engine.tryLockAt(p.centerX(), p.centerY(), lockSnap));
+
+            // 1. Kisi kisa sureligine (850 ms) gizlensin -> ~1.8 sn tamponu SAHTE ALARM CALMAMALI!
+            Bitmap blank = Bitmap.createBitmap(480, 360, Bitmap.Config.ARGB_8888);
+            blank.eraseColor(Color.BLACK);
+            engine.processFrame(blank);
+            Thread.sleep(850);
+            PersonDetectorEngine.AnalysisOutput midOut = engine.processFrame(blank);
+            assertNotNull(midOut.locked);
+            assertFalse("850ms kisa gizlenmede sahte kayip alarmi tetiklenmemeli!", midOut.targetJustLost);
+            assertFalse("850ms kisa gizlenmede lost false kalmali!", midOut.locked.lost);
+            assertTrue("Kisa gizlenmede isOccluded true olmali!", midOut.locked.isOccluded);
+
+            // 2. Kisi 1.8 sn'den fazla gorunmeyince gercek alarm tetiklenmeli!
+            Thread.sleep(1050);
+            PersonDetectorEngine.AnalysisOutput lostOut = engine.processFrame(blank);
+            assertTrue("1.9s sonra gercek kayip alarmi tetiklenmeli!", lostOut.targetJustLost);
+            assertTrue("lost true olmali!", lostOut.locked.lost);
+            blank.recycle();
+        } finally {
+            engine.close();
+            if (memFile.exists()) memFile.delete();
+        }
+    }
+
+    @Test
+    public void testOsnetReidBackgroundAndNoFaceRecovery() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        NeuralIdentityEngine neural = new NeuralIdentityEngine(ctx);
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            assertTrue("OSNet MSMT17 modeli hazir olmali", neural.isReidReady());
+            assertEquals("OSNet cikti boyutu 512 olmali", 512, neural.getReidEmbedDim());
+
+            Bitmap roomBmp = BitmapFactory.decodeStream(is);
+            // Ayni kisinin orijinal govdesi vs aynalanmis + %40 karartilmis govdesi vs tamamen farkli renkli kisi
+            NeuralIdentityEngine.BodyReidResult rOrig = neural.extractBodyReid(roomBmp, 0.24f, 0.12f, 0.48f, 0.84f);
+            assertNotNull(rOrig.embedding);
+            assertTrue("Net goruntu Laplacian keskinlik kapisini gecmeli, sharpness=" + rOrig.sharpness, rOrig.isSharp);
+
+            // Aynalanmis ve %40 karartilmis kopya (arka plan + isik degisimi + aci tersi)
+            Bitmap modBmp = Bitmap.createBitmap(roomBmp.getWidth(), roomBmp.getHeight(), Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas c = new android.graphics.Canvas(modBmp);
+            android.graphics.Matrix m = new android.graphics.Matrix();
+            m.setScale(-1f, 1f, roomBmp.getWidth() * 0.5f, roomBmp.getHeight() * 0.5f);
+            android.graphics.Paint p = new android.graphics.Paint();
+            android.graphics.ColorMatrix cm = new android.graphics.ColorMatrix();
+            cm.setScale(0.60f, 0.58f, 0.54f, 1.0f);
+            p.setColorFilter(new android.graphics.ColorMatrixColorFilter(cm));
+            c.drawBitmap(roomBmp, m, p);
+
+            NeuralIdentityEngine.BodyReidResult rMirrorDark = neural.extractBodyReid(modBmp, 0.28f, 0.12f, 0.48f, 0.84f);
+            assertNotNull(rMirrorDark.embedding);
+
+            // Tamamen farkli sentetik kisi (parlak kirmizi ust + mavi alt)
+            Bitmap diffBmp = Bitmap.createBitmap(240, 400, Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas dc = new android.graphics.Canvas(diffBmp);
+            dc.drawColor(Color.rgb(35, 38, 44));
+            android.graphics.Paint dp = new android.graphics.Paint();
+            dp.setColor(Color.rgb(215, 175, 145));
+            dc.drawRect(80, 25, 160, 100, dp);
+            dp.setColor(Color.rgb(220, 35, 30));
+            dc.drawRect(50, 100, 190, 240, dp);
+            dp.setColor(Color.rgb(30, 130, 225));
+            dc.drawRect(60, 240, 180, 380, dp);
+            NeuralIdentityEngine.BodyReidResult rDiff = neural.extractBodyReid(diffBmp, 0.10f, 0.04f, 0.80f, 0.92f);
+            assertNotNull(rDiff.embedding);
+
+            float sameSim = NeuralIdentityEngine.cosineSim(rOrig.embedding, rMirrorDark.embedding);
+            float diffSim = NeuralIdentityEngine.cosineSim(rOrig.embedding, rDiff.embedding);
+            assertTrue("OSNet ayni kisiyi karanlik/ayna degisiminde yuksek tanimali (sim=" + sameSim + ")", sameSim >= 0.72f);
+            assertTrue("OSNet farkli kisiyi belirgin sekilde ayirmali (same=" + sameSim + ", diff=" + diffSim + ")",
+                    sameSim - diffSim >= 0.20f);
+
+            modBmp.recycle();
+            diffBmp.recycle();
+        } finally {
+            neural.close();
+        }
+    }
+
+    @Test
+    public void testRoomBackgroundMaskSuppressesWallPixels() {
+        int w = 80, h = 60;
+        RoomBackgroundMask mask = new RoomBackgroundMask(w, h);
+        int[] emptyRoom = new int[w * h];
+        java.util.Arrays.fill(emptyRoom, Color.rgb(210, 205, 195)); // Acik bej duvar
+
+        // 4 bos oda karesiyle duvari ogren
+        for (int i = 0; i < 4; i++) {
+            mask.updateWithFrame(emptyRoom, java.util.Collections.emptyList());
+        }
+        assertTrue("Bos oda duvarinin tamami ogrenilmis olmali", mask.getLearnedCoverageRatio() > 0.99f);
+
+        // Koyu lacivert tisortlu kisi sahneye girer: duvar pikseli ~0.06, kisi pikseli 1.0 agirlik almali!
+        int wallIdx = 10 * w + 10;
+        float wallWeight = mask.getForegroundWeight(wallIdx, 210, 205, 195);
+        float personWeight = mask.getForegroundWeight(wallIdx, 25, 40, 110);
+        assertTrue("Statik duvar pikseli bastirilmali (w=" + wallWeight + ")", wallWeight < 0.15f);
+        assertTrue("On plandaki kisi pikseli tam agirlik almali (w=" + personWeight + ")", personWeight > 0.95f);
+
+        // Kisi kutusu icindeki pikseller 10 kare boyunca arka plana ASLA karismamali!
+        int[] withPerson = emptyRoom.clone();
+        for (int y = 15; y < 45; y++) {
+            for (int x = 25; x < 55; x++) {
+                withPerson[y * w + x] = Color.rgb(25, 40, 110);
+            }
+        }
+        TrackedPerson box = new TrackedPerson(1, 25f / w, 15f / h, 30f / w, 30f / h, 0.9f);
+        for (int i = 0; i < 10; i++) {
+            mask.updateWithFrame(withPerson, java.util.Collections.singletonList(box));
+        }
+        int personCenterIdx = 30 * w + 40;
+        assertTrue("Oturan kisi 10 kare sonra bile hala on plan kalmali!",
+                mask.getForegroundWeight(personCenterIdx, 25, 40, 110) > 0.90f);
+    }
+
+    @Test
+    public void testHungarianAssignmentAndLaplacianSharpnessGate() {
+        // 1. Klasik 2-kisi kesisme matrisi:
+        //    Satir 0 (Kisi A) -> Sutun 0 (0.85), Sutun 1 (0.90)
+        //    Satir 1 (Kisi B) -> Sutun 0 (0.10), Sutun 1 (0.88)
+        //    Acgozlu algoritma Satir 0'i Sutun 1'e verip Satir 1'i bozardi; Hungarian (0->0, 1->1 = 1.73) secer!
+        float[][] scores = {
+                {0.85f, 0.90f},
+                {0.10f, 0.88f}
+        };
+        int[] assign = SmartTrackerMath.solveMaxAssignment(scores, 0.40f);
+        assertEquals("Global optimal eslestirme Kisi A'yi 0'a atamali", 0, assign[0]);
+        assertEquals("Global optimal eslestirme Kisi B'yi 1'e atamali", 1, assign[1]);
+
+        // 2. Laplacian keskinlik kapisi: net damali desen vs bulanik tek renk/duz gecis
+        int w = 64, h = 64;
+        int[] sharpPx = new int[w * h];
+        int[] blurPx = new int[w * h];
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int vSharp = (((x / 3) + (y / 3)) % 2 == 0) ? 230 : 25;
+                sharpPx[y * w + x] = Color.rgb(vSharp, vSharp, vSharp);
+                int vBlur = 120 + (x / 16);
+                blurPx[y * w + x] = Color.rgb(vBlur, vBlur, vBlur);
+            }
+        }
+        float sharpScore = SmartTrackerMath.computeLaplacianSharpness(sharpPx, w, h, 4, 4, w - 4, h - 4, 1);
+        float blurScore = SmartTrackerMath.computeLaplacianSharpness(blurPx, w, h, 4, 4, w - 4, h - 4, 1);
+        assertTrue("Net goruntu yuksek keskinlik vermeli (sharp=" + sharpScore + ")", sharpScore > 500f);
+        assertTrue("Bulanik goruntu dusuk keskinlik vermeli (blur=" + blurScore + ")", blurScore < 10f);
+    }
+
+    @Test
+    public void testGuided360EnrollmentPersistsAllThreeLayers() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        java.io.File memFile = new java.io.File(ctx.getCacheDir(), "test_enroll_v3.bin");
+        if (memFile.exists()) memFile.delete();
+
+        int enrolledId;
+        PersonDetectorEngine engine1 = new PersonDetectorEngine(ctx, memFile);
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            Bitmap roomBmp = BitmapFactory.decodeStream(is);
+            PersonDetectorEngine.AnalysisOutput out1 = engine1.processFrame(roomBmp);
+            assertFalse(out1.persons.isEmpty());
+            enrolledId = out1.persons.get(0).id;
+
+            assertTrue("360 derece rehberli tanitim baslamali", engine1.startGuidedEnrollment(enrolledId, "Selim360"));
+            Thread.sleep(180);
+            PersonDetectorEngine.AnalysisOutput out2 = engine1.processFrame(roomBmp);
+            assertNotNull("Tanitim durumu donmeli", out2.enrollment);
+            assertTrue("Tanitim aktif olmali", out2.enrollment.active);
+
+            engine1.waitForPendingIdentityWork(3000);
+            assertTrue("Tanitim tamamlanmali", engine1.finishGuidedEnrollmentNow());
+        } finally {
+            engine1.close();
+        }
+
+        // Uygulama yeniden acilmis gibi sifirdan baslat -> 3 katmanin tamami (OSNet + Yuz + 129-D) diskten yuklenmeli!
+        PersonDetectorEngine engine2 = new PersonDetectorEngine(ctx, memFile);
+        try {
+            java.util.List<PersonMemoryStore.ProfileSummary> summaries = engine2.getMemorySummaries();
+            assertEquals("1 kalici 360 profili yuklenmeli", 1, summaries.size());
+            PersonMemoryStore.ProfileSummary prof = summaries.get(0);
+            assertEquals(enrolledId, prof.id);
+            assertEquals("Selim360", prof.name);
+            assertTrue("Enrolled bayragi korunmali", prof.enrolled);
+            assertTrue("129-D aci hafizasi diskten yuklenmeli", prof.sigCount >= 1);
+            assertTrue("OSNet 512-D derin hafizasi diskten yuklenmeli", prof.deepCount >= 1);
+            assertTrue("MobileFaceNet 192-D yuz hafizasi diskten yuklenmeli", prof.faceCount >= 1);
+        } finally {
+            engine2.close();
+            if (memFile.exists()) memFile.delete();
+        }
     }
 }

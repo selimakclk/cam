@@ -30,42 +30,95 @@ import java.nio.channels.FileChannel;
 import java.util.List;
 
 /**
- * Hafif & Asenkron Biyometrik Yüz Tanıma Motoru (v2.5):
- *  - MediaPipe BlazeFace Short-Range (229 KB) ile yüksek güvenli ön yüz & göz hizalama tespiti.
- *  - Google LiteRT MobileFaceNet (192-D L2-normalize yüz vektörü).
- *
- * Ana SSD insan tespit thread'ini ASLA bloklamaz; ayrı arka plan thread'inde çalışarak
- * kıyafet değişiminde ve isimli kalıcı hafızada ekstra doğruluk sağlar.
+ * 3-Katmanlı Asenkron Yapay Zeka Kimlik Motoru (v3.0 — Ana FPS'yi ASLA bloklamaz!):
+ *  1. OSNet Person Re-ID (osnet_x0_25_msmt17.tflite — MSMT17 çoklu-kamera veri setiyle eğitilmiş gerçek İnsan Re-ID):
+ *     - 128x256 vücut kırpımından 512-D L2-normalize kimlik gömmesi çıkarır.
+ *     - Arka plan, duvar rengi, gölge ve açı değişimlerinde aynı kişiyi yüksek tutarlılıkla tanır;
+ *       farklı insanları kesin ayırır.
+ *     - Laplacian keskinlik kapısı ile hareket bulanık karelerin hafızayı kirletmesini engeller.
+ *  2. Biyometrik Yüz AI (BlazeFace Short-Range + MobileFaceNet 192-D):
+ *     - Göz hizalama + burun-göz ön-yüz simetri kontrolü + Laplacian keskinlik kapısı.
+ *     - Kıyafet tamamen değişse veya uygulama yeniden açılsa bile kayıtlı kişiyi yüzünden anında tanır.
  */
 public class NeuralIdentityEngine {
 
     private static final String TAG = "NeuralIdentityEngine";
+    private static final String OSNET_REID_MODEL = "osnet_x0_25_msmt17.tflite";
     private static final String FACE_DETECTOR_MODEL = "blaze_face_short_range.tflite";
     private static final String FACE_EMBEDDER_MODEL = "mobilefacenet.tflite";
 
+    // OSNet MSMT17 giriş boyutları ve ImageNet normalizasyon sabitleri
+    private static final int REID_W = 128;
+    private static final int REID_H = 256;
+    private static final float IMAGENET_MEAN_R = 0.485f;
+    private static final float IMAGENET_MEAN_G = 0.456f;
+    private static final float IMAGENET_MEAN_B = 0.406f;
+    private static final float IMAGENET_INV_STD_R = 1.0f / 0.229f;
+    private static final float IMAGENET_INV_STD_G = 1.0f / 0.224f;
+    private static final float IMAGENET_INV_STD_B = 1.0f / 0.225f;
+
+    // Yüz AI boyutları ve kalite kapıları
     private static final int HEAD_CROP_SIZE = 224;
     private static final int FACE_INPUT_SIZE = 112;
-    private static final float MIN_FACE_SCORE = 0.62f; // Yalnızca net yüzler (bulanık yan profiller hafızayı kirletmez)
+    private static final float MIN_FACE_SCORE = 0.62f;
     private static final float MIN_FACE_PX = 24f;
 
-    public static class FaceResult {
-        public float[] faceEmbedding; // 192-D unit-norm MobileFaceNet
-        public float faceScore;
-        public boolean isFrontal;
+    // Laplacian keskinlik eşikleri (bulanık karelerin hafızayı zehirlemesini engeller)
+    public static final float MIN_BODY_SHARPNESS = 22.0f;
+    public static final float MIN_FACE_SHARPNESS = 28.0f;
+
+    public static class BodyReidResult {
+        public float[] embedding;   // 512-D L2-normalize OSNet vektörü
+        public float sharpness;     // Laplacian keskinlik varyansı
+        public boolean isSharp;
     }
 
+    public static class FaceResult {
+        public float[] faceEmbedding; // 192-D L2-normalize MobileFaceNet vektörü
+        public float faceScore;
+        public float sharpness;       // Laplacian keskinlik varyansı
+        public boolean isFrontal;
+        public boolean isSharp;
+    }
+
+    public static class IdentityResult {
+        public BodyReidResult body;
+        public FaceResult face;
+    }
+
+    // OSNet Person Re-ID durumu
+    private Interpreter reidInterpreter;
+    private int reidEmbedDim = 512;
+    private boolean reidInputNchw = false; // Tensor şeklinden otomatik algılanır
+    private volatile boolean reidReady = false;
+
+    // Face AI durumu
     private FaceDetector faceDetector;
     private Interpreter faceInterpreter;
     private int faceEmbedDim = 192;
-
     private volatile boolean faceReady = false;
-    private volatile boolean closed = false;
 
+    private volatile boolean closed = false;
+    private final Object reidLock = new Object();
     private final Object faceLock = new Object();
 
+    // OSNet sıfır-GC tamponları
+    private final Bitmap reidCropBitmap = Bitmap.createBitmap(REID_W, REID_H, Bitmap.Config.ARGB_8888);
+    private final Canvas reidCropCanvas = new Canvas(reidCropBitmap);
+    private final int[] reidPixels = new int[REID_W * REID_H];
+    private final ByteBuffer reidInputBuffer = ByteBuffer
+            .allocateDirect(REID_W * REID_H * 3 * 4)
+            .order(ByteOrder.nativeOrder());
+    private ByteBuffer reidOutputBuffer = ByteBuffer
+            .allocateDirect(512 * 4)
+            .order(ByteOrder.nativeOrder());
+    private float[] reidOutputFloats = new float[512];
+    private final Rect reidSrcRect = new Rect();
+    private final Rect reidDstRect = new Rect(0, 0, REID_W, REID_H);
+
+    // Yüz AI sıfır-GC tamponları
     private final Bitmap headCropBitmap = Bitmap.createBitmap(HEAD_CROP_SIZE, HEAD_CROP_SIZE, Bitmap.Config.ARGB_8888);
     private final Canvas headCropCanvas = new Canvas(headCropBitmap);
-
     private final Bitmap faceInputBitmap = Bitmap.createBitmap(FACE_INPUT_SIZE, FACE_INPUT_SIZE, Bitmap.Config.ARGB_8888);
     private final Canvas faceInputCanvas = new Canvas(faceInputBitmap);
     private final int[] facePixels = new int[FACE_INPUT_SIZE * FACE_INPUT_SIZE];
@@ -75,12 +128,45 @@ public class NeuralIdentityEngine {
     private float[][] faceOutputBuf = new float[1][192];
 
     private final Paint bilinearPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-    private final Rect srcRect = new Rect();
-    private final Rect dstRect = new Rect();
+    private final Rect faceSrcRect = new Rect();
+    private final Rect faceDstRect = new Rect();
     private final Matrix alignMatrix = new Matrix();
 
     public NeuralIdentityEngine(Context context) {
+        initReidPipeline(context);
         initFacePipeline(context);
+    }
+
+    private void initReidPipeline(Context context) {
+        try {
+            ByteBuffer modelBuf = loadAssetModelBuffer(context, OSNET_REID_MODEL);
+            Interpreter.Options opts = new Interpreter.Options();
+            opts.setNumThreads(2);
+            opts.setUseXNNPACK(true);
+            reidInterpreter = new Interpreter(modelBuf, opts);
+
+            int[] inShape = reidInterpreter.getInputTensor(0).shape();
+            // [1, 3, 256, 128] -> NCHW, [1, 256, 128, 3] -> NHWC
+            reidInputNchw = (inShape != null && inShape.length == 4 && inShape[1] == 3);
+
+            int[] outShape = reidInterpreter.getOutputTensor(0).shape();
+            int totalElems = 1;
+            if (outShape != null && outShape.length > 0) {
+                for (int d : outShape) if (d > 0) totalElems *= d;
+            }
+            if (totalElems > 0) {
+                reidEmbedDim = totalElems;
+                reidOutputBuffer = ByteBuffer.allocateDirect(reidEmbedDim * 4).order(ByteOrder.nativeOrder());
+                reidOutputFloats = new float[reidEmbedDim];
+            }
+            reidReady = true;
+            Log.i(TAG, "Asenkron OSNet MSMT17 Person Re-ID hazır (" + reidEmbedDim + "-D, "
+                    + (reidInputNchw ? "NCHW" : "NHWC") + ", DirectByteBuffer).");
+        } catch (Throwable t) {
+            reidReady = false;
+            Log.w(TAG, "OSNet Re-ID başlatılamadı (maskeli 129-D ile devam): " + t.getMessage());
+            closeQuietlyReid();
+        }
     }
 
     private void initFacePipeline(Context context) {
@@ -99,7 +185,6 @@ public class NeuralIdentityEngine {
 
             ByteBuffer modelBuf = loadAssetModelBuffer(context, FACE_EMBEDDER_MODEL);
             Interpreter.Options tfliteOpts = new Interpreter.Options();
-            // Arka plan yüz motoru ana SSD'den CPU çalmasın diye 2 iş parçacığı ile sınırlı
             tfliteOpts.setNumThreads(2);
             tfliteOpts.setUseXNNPACK(true);
             faceInterpreter = new Interpreter(modelBuf, tfliteOpts);
@@ -113,7 +198,7 @@ public class NeuralIdentityEngine {
             Log.i(TAG, "Asenkron BlazeFace + MobileFaceNet (" + faceEmbedDim + "-D) yüz motoru hazır.");
         } catch (Throwable t) {
             faceReady = false;
-            Log.w(TAG, "Yüz tanıma motoru başlatılamadı (hızlı Re-ID ile devam): " + t.getMessage());
+            Log.w(TAG, "Yüz tanıma motoru başlatılamadı: " + t.getMessage());
             closeQuietlyFace();
         }
     }
@@ -139,8 +224,16 @@ public class NeuralIdentityEngine {
         }
     }
 
+    public boolean isReidReady() {
+        return reidReady && !closed;
+    }
+
     public boolean isFaceReady() {
         return faceReady && !closed;
+    }
+
+    public int getReidEmbedDim() {
+        return reidEmbedDim;
     }
 
     public int getFaceEmbedDim() {
@@ -148,9 +241,97 @@ public class NeuralIdentityEngine {
     }
 
     public String getActiveEnginesSummary() {
-        return faceReady
-                ? "Hızlı SSD-300 + 129-D Re-ID + Asenkron Yüz AI"
-                : "Hızlı SSD-300 + 129-D Çok-İpuculu Re-ID";
+        if (reidReady && faceReady) {
+            return "EfficientDet-INT8 + Maskeli 129-D + OSNet 512-D + Yüz AI";
+        } else if (reidReady) {
+            return "EfficientDet-INT8 + Maskeli 129-D + OSNet 512-D";
+        } else if (faceReady) {
+            return "EfficientDet-INT8 + Maskeli 129-D + Yüz AI";
+        }
+        return "EfficientDet-INT8 + Maskeli 129-D Re-ID";
+    }
+
+    public IdentityResult extractIdentity(
+            Bitmap fullBitmap, float nx, float ny, float nw, float nh,
+            boolean runBodyReid, boolean runFace) {
+        IdentityResult res = new IdentityResult();
+        if (closed || fullBitmap == null || fullBitmap.isRecycled()) return res;
+        if (runBodyReid && reidReady) {
+            res.body = extractBodyReid(fullBitmap, nx, ny, nw, nh);
+        }
+        if (runFace && faceReady) {
+            res.face = extractFace(fullBitmap, nx, ny, nw, nh);
+        }
+        return res;
+    }
+
+    /**
+     * OSNet MSMT17 ile 512-D derin insan Re-ID vektörü ve keskinlik puanı çıkarır.
+     */
+    public BodyReidResult extractBodyReid(Bitmap fullBitmap, float nx, float ny, float nw, float nh) {
+        BodyReidResult out = new BodyReidResult();
+        if (closed || !reidReady || fullBitmap == null || fullBitmap.isRecycled()) return out;
+
+        synchronized (reidLock) {
+            if (closed || !reidReady || reidInterpreter == null || fullBitmap.isRecycled()) return out;
+            try {
+                int bw = fullBitmap.getWidth();
+                int bh = fullBitmap.getHeight();
+                // Kişi kutusunun kenarındaki duvarı biraz dışarıda bırakmak için hafifçe içe sıkıştır (%3 yatay)
+                float insetX = nw * 0.03f;
+                int x0 = Math.max(0, Math.min(bw - 8, Math.round((nx + insetX) * bw)));
+                int x1 = Math.max(x0 + 8, Math.min(bw, Math.round((nx + nw - insetX) * bw)));
+                int y0 = Math.max(0, Math.min(bh - 12, Math.round(ny * bh)));
+                int y1 = Math.max(y0 + 12, Math.min(bh, Math.round((ny + nh) * bh)));
+                if (x1 - x0 < 14 || y1 - y0 < 24) return out;
+
+                reidSrcRect.set(x0, y0, x1, y1);
+                reidCropCanvas.drawBitmap(fullBitmap, reidSrcRect, reidDstRect, bilinearPaint);
+                reidCropBitmap.getPixels(reidPixels, 0, REID_W, 0, 0, REID_W, REID_H);
+
+                // Laplacian keskinlik kontrolü (<0.04 ms)
+                out.sharpness = SmartTrackerMath.computeLaplacianSharpness(
+                        reidPixels, REID_W, REID_H, 10, 12, REID_W - 10, REID_H - 12, 2);
+                out.isSharp = (out.sharpness >= MIN_BODY_SHARPNESS);
+
+                reidInputBuffer.rewind();
+                if (reidInputNchw) {
+                    int planeSize = REID_W * REID_H;
+                    for (int i = 0; i < planeSize; i++) {
+                        float r = ((reidPixels[i] >> 16) & 0xFF) * (1f / 255f);
+                        reidInputBuffer.putFloat((r - IMAGENET_MEAN_R) * IMAGENET_INV_STD_R);
+                    }
+                    for (int i = 0; i < planeSize; i++) {
+                        float g = ((reidPixels[i] >> 8) & 0xFF) * (1f / 255f);
+                        reidInputBuffer.putFloat((g - IMAGENET_MEAN_G) * IMAGENET_INV_STD_G);
+                    }
+                    for (int i = 0; i < planeSize; i++) {
+                        float b = (reidPixels[i] & 0xFF) * (1f / 255f);
+                        reidInputBuffer.putFloat((b - IMAGENET_MEAN_B) * IMAGENET_INV_STD_B);
+                    }
+                } else {
+                    for (int i = 0; i < reidPixels.length; i++) {
+                        int argb = reidPixels[i];
+                        float r = ((argb >> 16) & 0xFF) * (1f / 255f);
+                        float g = ((argb >> 8) & 0xFF) * (1f / 255f);
+                        float b = (argb & 0xFF) * (1f / 255f);
+                        reidInputBuffer.putFloat((r - IMAGENET_MEAN_R) * IMAGENET_INV_STD_R);
+                        reidInputBuffer.putFloat((g - IMAGENET_MEAN_G) * IMAGENET_INV_STD_G);
+                        reidInputBuffer.putFloat((b - IMAGENET_MEAN_B) * IMAGENET_INV_STD_B);
+                    }
+                }
+                reidInputBuffer.rewind();
+
+                reidOutputBuffer.rewind();
+                reidInterpreter.run(reidInputBuffer, reidOutputBuffer);
+                reidOutputBuffer.rewind();
+                reidOutputBuffer.asFloatBuffer().get(reidOutputFloats);
+                out.embedding = l2NormalizeCopy(reidOutputFloats);
+            } catch (Throwable t) {
+                Log.w(TAG, "OSNet Re-ID hatası: " + t.getMessage());
+            }
+        }
+        return out;
     }
 
     public FaceResult extractFace(Bitmap fullBitmap, float nx, float ny, float nw, float nh) {
@@ -193,12 +374,12 @@ public class NeuralIdentityEngine {
         int padY = (HEAD_CROP_SIZE - drawH) / 2;
 
         headCropBitmap.eraseColor(Color.BLACK);
-        srcRect.set(hx0, hy0, hx1, hy1);
-        dstRect.set(padX, padY, padX + drawW, padY + drawH);
-        headCropCanvas.drawBitmap(full, srcRect, dstRect, bilinearPaint);
+        faceSrcRect.set(hx0, hy0, hx1, hy1);
+        faceDstRect.set(padX, padY, padX + drawW, padY + drawH);
+        headCropCanvas.drawBitmap(full, faceSrcRect, faceDstRect, bilinearPaint);
 
         try {
-            // NOT: headCropBitmap yeniden kullanıldığı için headMp.close() çağrılmaz.
+            // NOT: headCropBitmap yeniden kullanıldığı için headMp.close() çağrılmaz (Bitmap.recycle önlenir).
             MPImage headMp = new BitmapImageBuilder(headCropBitmap).build();
             FaceDetectorResult fdRes = faceDetector.detect(headMp);
             if (fdRes == null || fdRes.detections() == null || fdRes.detections().isEmpty()) {
@@ -256,7 +437,6 @@ public class NeuralIdentityEngine {
                     if (dx > 8f) {
                         float deg = (float) Math.toDegrees(Math.atan2(dy, dx));
                         if (Math.abs(deg) <= 35f) angleDeg = deg;
-                        // Burun iki göz arasında simetrikse gerçekten ön yüzdür (yan profil değil!)
                         float minEyeX = Math.min(e0.x(), e1.x());
                         float maxEyeX = Math.max(e0.x(), e1.x());
                         float eyeSpan = Math.max(1e-4f, maxEyeX - minEyeX);
@@ -282,6 +462,12 @@ public class NeuralIdentityEngine {
             faceInputCanvas.drawBitmap(full, alignMatrix, bilinearPaint);
 
             faceInputBitmap.getPixels(facePixels, 0, FACE_INPUT_SIZE, 0, 0, FACE_INPUT_SIZE, FACE_INPUT_SIZE);
+
+            // Yüz keskinlik kapısı: hareket bulanık yüzler hafızaya eklenmez!
+            out.sharpness = SmartTrackerMath.computeLaplacianSharpness(
+                    facePixels, FACE_INPUT_SIZE, FACE_INPUT_SIZE, 14, 14, FACE_INPUT_SIZE - 14, FACE_INPUT_SIZE - 14, 2);
+            out.isSharp = (out.sharpness >= MIN_FACE_SHARPNESS);
+
             faceInputBuffer.rewind();
             for (int i = 0; i < facePixels.length; i++) {
                 int argb = facePixels[i];
@@ -325,6 +511,11 @@ public class NeuralIdentityEngine {
         return Math.max(-1f, Math.min(1f, dot));
     }
 
+    private void closeQuietlyReid() {
+        try { if (reidInterpreter != null) reidInterpreter.close(); } catch (Exception ignored) {}
+        reidInterpreter = null;
+    }
+
     private void closeQuietlyFace() {
         try { if (faceDetector != null) faceDetector.close(); } catch (Exception ignored) {}
         try { if (faceInterpreter != null) faceInterpreter.close(); } catch (Exception ignored) {}
@@ -334,6 +525,10 @@ public class NeuralIdentityEngine {
 
     public void close() {
         closed = true;
+        synchronized (reidLock) {
+            closeQuietlyReid();
+            if (!reidCropBitmap.isRecycled()) reidCropBitmap.recycle();
+        }
         synchronized (faceLock) {
             closeQuietlyFace();
             if (!headCropBitmap.isRecycled()) headCropBitmap.recycle();

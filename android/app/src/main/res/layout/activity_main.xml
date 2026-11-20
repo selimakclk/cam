@@ -88,10 +88,25 @@
                     android:textStyle="bold" />
 
                 <androidx.appcompat.widget.AppCompatButton
-                    android:id="@+id/btnNameTarget"
+                    android:id="@+id/btnEnrollTarget"
                     android:layout_width="wrap_content"
                     android:layout_height="30dp"
                     android:layout_marginStart="8dp"
+                    android:background="@drawable/btn_pill"
+                    android:minWidth="0dp"
+                    android:paddingHorizontal="10dp"
+                    android:text="360° Tanıt"
+                    android:textAllCaps="false"
+                    android:textColor="#30D158"
+                    android:textSize="11sp"
+                    android:textStyle="bold"
+                    android:visibility="gone" />
+
+                <androidx.appcompat.widget.AppCompatButton
+                    android:id="@+id/btnNameTarget"
+                    android:layout_width="wrap_content"
+                    android:layout_height="30dp"
+                    android:layout_marginStart="6dp"
                     android:background="@drawable/btn_pill"
                     android:minWidth="0dp"
                     android:paddingHorizontal="10dp"
@@ -116,6 +131,43 @@
                     android:textSize="11sp"
                     android:textStyle="bold"
                     android:visibility="gone" />
+            </LinearLayout>
+
+            <!-- 360° Rehberli Kişi Tanıtım Kapsülü -->
+            <LinearLayout
+                android:id="@+id/enrollBanner"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_capsule"
+                android:gravity="center_vertical"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="7dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/txtEnrollGuide"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="360° Kayıt (1/3) • Kameraya Bakın"
+                    android:textColor="#30D158"
+                    android:textSize="12sp"
+                    android:textStyle="bold" />
+
+                <androidx.appcompat.widget.AppCompatButton
+                    android:id="@+id/btnEnrollDone"
+                    android:layout_width="wrap_content"
+                    android:layout_height="26dp"
+                    android:layout_marginStart="10dp"
+                    android:background="@drawable/btn_pill"
+                    android:minWidth="0dp"
+                    android:paddingHorizontal="10dp"
+                    android:text="Bitir"
+                    android:textAllCaps="false"
+                    android:textColor="#FFFFFF"
+                    android:textSize="11sp"
+                    android:textStyle="bold" />
             </LinearLayout>
 
             <!-- Anlık Uyarı Hapı (Boş yere dokununca çıkar) -->

@@ -59,6 +59,10 @@ public class MainActivity extends AppCompatActivity {
     private TextView txtFpsDisplay;
     private Button btnUnlock;
     private Button btnNameTarget;
+    private Button btnEnrollTarget;
+    private LinearLayout enrollBanner;
+    private TextView txtEnrollGuide;
+    private Button btnEnrollDone;
     private Button btnMemory;
     private Button btnTorch;
 
@@ -251,6 +255,10 @@ public class MainActivity extends AppCompatActivity {
         txtFpsDisplay = findViewById(R.id.txtFpsDisplay);
         btnUnlock = findViewById(R.id.btnUnlock);
         btnNameTarget = findViewById(R.id.btnNameTarget);
+        btnEnrollTarget = findViewById(R.id.btnEnrollTarget);
+        enrollBanner = findViewById(R.id.enrollBanner);
+        txtEnrollGuide = findViewById(R.id.txtEnrollGuide);
+        btnEnrollDone = findViewById(R.id.btnEnrollDone);
         btnMemory = findViewById(R.id.btnMemory);
         btnTorch = findViewById(R.id.btnTorch);
 
@@ -299,6 +307,21 @@ public class MainActivity extends AppCompatActivity {
             PersonDetectorEngine.LockedState locked = eng.getLockedStateSnapshot();
             if (locked != null) {
                 promptRenamePersonDialog(locked.id, locked.name);
+            }
+        });
+        btnEnrollTarget.setOnClickListener(v -> {
+            PersonDetectorEngine eng = getActiveEngine();
+            if (eng == null) return;
+            PersonDetectorEngine.LockedState locked = eng.getLockedStateSnapshot();
+            if (locked != null) {
+                promptGuidedEnrollDialog(locked.id, locked.name);
+            }
+        });
+        btnEnrollDone.setOnClickListener(v -> {
+            PersonDetectorEngine eng = getActiveEngine();
+            if (eng != null && eng.finishGuidedEnrollmentNow()) {
+                enrollBanner.setVisibility(View.GONE);
+                Toast.makeText(this, "360° kişi hafıza kaydı kalıcı olarak tamamlandı", Toast.LENGTH_SHORT).show();
             }
         });
 
@@ -529,6 +552,26 @@ public class MainActivity extends AppCompatActivity {
                 btnMemory.setText(memLabel);
             }
         }
+
+        if (enrollBanner != null) {
+            if (out.enrollment != null && out.enrollment.active) {
+                if (enrollBanner.getVisibility() != View.VISIBLE) {
+                    enrollBanner.setVisibility(View.VISIBLE);
+                }
+                txtEnrollGuide.setText(out.enrollment.instruction);
+            } else if (out.enrollment != null && out.enrollment.justCompleted) {
+                enrollBanner.setVisibility(View.GONE);
+                String who = (out.enrollment.targetName != null && !out.enrollment.targetName.trim().isEmpty())
+                        ? out.enrollment.targetName.trim()
+                        : ("Kişi #" + out.enrollment.targetId);
+                Toast.makeText(this,
+                        "✓ " + who + " 360° Tanıtıldı! (OSNet:" + out.enrollment.deepSamples
+                                + " • Yüz:" + out.enrollment.faceSamples + ")",
+                        Toast.LENGTH_LONG).show();
+            } else if (enrollBanner.getVisibility() == View.VISIBLE) {
+                enrollBanner.setVisibility(View.GONE);
+            }
+        }
     }
 
     private void updateTargetHud(PersonDetectorEngine.LockedState locked) {
@@ -543,9 +586,16 @@ public class MainActivity extends AppCompatActivity {
                     ? ("KAYIP: " + locked.displayLabel() + "!")
                     : ("KAYIP: " + locked.displayLabel() + "! (" + aiInfo + ")");
             newVis = View.VISIBLE;
+        } else if (locked.isOccluded) {
+            newTargetText = "Kısa Gizlenme: " + locked.displayLabel() + " (Bekleniyor...)";
+            newVis = View.VISIBLE;
         } else {
             int pct = Math.round(locked.score * 100f);
-            String badge = locked.hasFaceAi ? " • Yüz+AI" : (locked.hasDeepAi ? " • Derin AI" : "");
+            String badge;
+            if (locked.hasFaceAi && locked.hasDeepAi) badge = " • Pro AI";
+            else if (locked.hasDeepAi) badge = " • OSNet";
+            else if (locked.hasFaceAi) badge = " • Yüz";
+            else badge = "";
             newTargetText = "Kilitli: " + locked.displayLabel() + " (%" + pct + badge + ")";
             newVis = View.VISIBLE;
         }
@@ -557,19 +607,21 @@ public class MainActivity extends AppCompatActivity {
             lastUnlockVisibility = newVis;
             btnUnlock.setVisibility(newVis);
             if (btnNameTarget != null) btnNameTarget.setVisibility(newVis);
+            if (btnEnrollTarget != null) btnEnrollTarget.setVisibility(newVis);
+            if (newVis == View.GONE && enrollBanner != null) enrollBanner.setVisibility(View.GONE);
         }
     }
 
     private String buildMemoryBadge(PersonDetectorEngine.LockedState locked) {
         if (locked == null) return "";
         StringBuilder sb = new StringBuilder();
-        if (locked.faceCount > 0) sb.append("Yüz:").append(locked.faceCount);
-        if (locked.deepCount > 0) {
+        if (locked.deepCount > 0) sb.append("OSNet:").append(locked.deepCount);
+        if (locked.faceCount > 0) {
             if (sb.length() > 0) sb.append(" ");
-            sb.append("AI:").append(locked.deepCount);
+            sb.append("Yüz:").append(locked.faceCount);
         }
         if (sb.length() == 0 && locked.memoryCount > 0) {
-            sb.append("Hafıza:").append(locked.memoryCount);
+            sb.append("Açı:").append(locked.memoryCount);
         }
         return sb.toString();
     }
@@ -584,22 +636,24 @@ public class MainActivity extends AppCompatActivity {
         String engineLine = "Motor: " + eng.getAiEngineSummary();
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle("Yapay Zeka Hafıza Bankası (" + profiles.size() + ")");
+        builder.setTitle("Pro Yapay Zeka Hafıza Bankası (" + profiles.size() + ")");
 
         if (profiles.isEmpty()) {
-            builder.setMessage(engineLine + "\n\nHenüz kayıtlı kişi yok. Kamerada bir kişi göründüğünde yüz ve derin vücut vektörleri otomatik öğrenilip kalıcı hafızaya kaydedilir.");
+            builder.setMessage(engineLine + "\n\nHenüz kayıtlı kişi yok. Kamerada bir kişi göründüğünde OSNet 512-D, biyometrik yüz ve arka plan maskeli açılar otomatik öğrenilir.");
         } else {
             CharSequence[] items = new CharSequence[profiles.size()];
             for (int i = 0; i < profiles.size(); i++) {
                 PersonMemoryStore.ProfileSummary p = profiles.get(i);
-                items[i] = p.displayLabel()
-                        + "  •  Yüz: " + p.faceCount
-                        + "  •  Açı Hafızası: " + p.sigCount;
+                String tag = p.enrolled ? " ★" : "";
+                items[i] = p.displayLabel() + tag
+                        + "  •  OSNet:" + p.deepCount
+                        + "  •  Yüz:" + p.faceCount
+                        + "  •  Açı:" + p.sigCount;
             }
             builder.setItems(items, (dialog, which) -> showProfileActionDialog(profiles.get(which)));
             builder.setNeutralButton("Tümünü Temizle", (d, w) -> new AlertDialog.Builder(this)
                     .setTitle("Hafızayı Temizle")
-                    .setMessage("Kayıtlı tüm kişi isimleri, yüz ve derin yapay zeka vektörleri kalıcı olarak silinsin mi?")
+                    .setMessage("Kayıtlı tüm kişi isimleri, OSNet, yüz ve açı vektörleri kalıcı olarak silinsin mi?")
                     .setPositiveButton("Sil", (d2, w2) -> {
                         PersonDetectorEngine e = getActiveEngine();
                         if (e != null) {
@@ -612,18 +666,74 @@ public class MainActivity extends AppCompatActivity {
                     .setNegativeButton("İptal", null)
                     .show());
         }
+        builder.setNegativeButton("360° Kişi Tanıt", (d, w) -> startQuickEnrollmentFromMenu());
         builder.setPositiveButton("Kapat", null);
         builder.show();
     }
 
+    private void startQuickEnrollmentFromMenu() {
+        PersonDetectorEngine eng = getActiveEngine();
+        if (eng == null) return;
+        PersonDetectorEngine.LockedState locked = eng.getLockedStateSnapshot();
+        if (locked != null) {
+            promptGuidedEnrollDialog(locked.id, locked.name);
+            return;
+        }
+        List<TrackedPerson> persons = eng.getLatestPersonsSnapshot();
+        if (persons == null || persons.isEmpty()) {
+            Toast.makeText(this, "360° tanıtım için önce kameranın karşısına bir kişi geçmeli", Toast.LENGTH_LONG).show();
+            return;
+        }
+        TrackedPerson biggest = persons.get(0);
+        for (TrackedPerson p : persons) {
+            if (p.area() > biggest.area()) biggest = p;
+        }
+        promptGuidedEnrollDialog(biggest.id, biggest.name);
+    }
+
+    private void promptGuidedEnrollDialog(int personId, String currentName) {
+        PersonDetectorEngine eng = getActiveEngine();
+        if (eng == null) return;
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle("360° Hızlı Kişi Tanıtımı");
+        b.setMessage("Ön yüz, yan açı ve arka profil 9 saniyede otomatik öğrenilip kalıcı hafızaya kaydedilir.\nİsterseniz aşağıya isim yazın:");
+        final EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
+        input.setHint("İsteğe bağlı isim (Örn: Selim)");
+        if (currentName != null && !currentName.trim().isEmpty()) {
+            input.setText(currentName.trim());
+            input.setSelection(input.getText().length());
+        }
+        b.setView(input);
+        b.setPositiveButton("Tanıtımı Başlat", (d, w) -> {
+            PersonDetectorEngine e = getActiveEngine();
+            if (e == null) return;
+            String chosenName = input.getText().toString().trim();
+            if (e.startGuidedEnrollment(personId, chosenName)) {
+                PersonDetectorEngine.LockedState snap = e.getLockedStateSnapshot();
+                updateTargetHud(snap);
+                if (enrollBanner != null) {
+                    enrollBanner.setVisibility(View.VISIBLE);
+                    txtEnrollGuide.setText("360° Kayıt (1/3) • Kameraya Bakın");
+                }
+            } else {
+                Toast.makeText(this, "Kişi kadrajda bulunamadı, lütfen tekrar deneyin", Toast.LENGTH_SHORT).show();
+            }
+        });
+        b.setNegativeButton("İptal", null);
+        b.show();
+    }
+
     private void showProfileActionDialog(PersonMemoryStore.ProfileSummary profile) {
-        CharSequence[] actions = {"İsim Ver / Değiştir", "Bu Kişiyi Hafızadan Sil"};
+        CharSequence[] actions = {"İsim Ver / Değiştir", "360° Yeniden Tanıt (Hafızayı Güçlendir)", "Bu Kişiyi Hafızadan Sil"};
         new AlertDialog.Builder(this)
                 .setTitle(profile.displayLabel())
                 .setItems(actions, (d, which) -> {
                     if (which == 0) {
                         promptRenamePersonDialog(profile.id, profile.name);
                     } else if (which == 1) {
+                        promptGuidedEnrollDialog(profile.id, profile.name);
+                    } else if (which == 2) {
                         PersonDetectorEngine e = getActiveEngine();
                         if (e != null) {
                             e.deletePersonFromMemory(profile.id);
@@ -916,6 +1026,7 @@ public class MainActivity extends AppCompatActivity {
         if (isStealthActive) exitStealthMode();
         if (viewerClient != null) viewerClient.stop();
         dismissAlarmVisualOnly();
+        if (enrollBanner != null) enrollBanner.setVisibility(View.GONE);
         overlayView.updateState(null, null);
 
         lastStatusText = "";
