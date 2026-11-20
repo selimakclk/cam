@@ -1,11 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="colorPrimary">#000000</color>
-    <color name="colorPrimaryDark">#000000</color>
-    <color name="colorAccent">#0071E3</color>
+    <!-- Kullanıcı Paleti: Charcoal Black #21232E · Royal Blue #105BFF · Tangerine Orange #FE8500 -->
+    <color name="charcoal_deep">#12141C</color>
+    <color name="charcoal_black">#21232E</color>
+    <color name="charcoal_elevated">#2B2E3E</color>
+    <color name="charcoal_input">#171923</color>
+
+    <color name="royal_blue">#105BFF</color>
+    <color name="royal_blue_light">#4D8AFF</color>
+    <color name="royal_blue_dark">#0A42B8</color>
+
+    <color name="tangerine_orange">#FE8500</color>
+    <color name="tangerine_light">#FFA33B</color>
+    <color name="tangerine_dark">#D96800</color>
+
+    <color name="text_primary">#F5F7FA</color>
+    <color name="text_secondary">#9BA1B8</color>
+    <color name="text_muted">#686F88</color>
+
+    <color name="colorPrimary">@color/charcoal_black</color>
+    <color name="colorPrimaryDark">@color/charcoal_deep</color>
+    <color name="colorAccent">@color/royal_blue</color>
     <color name="black">#000000</color>
     <color name="white">#FFFFFF</color>
-    <color name="surface">#1C1C1E</color>
-    <color name="danger">#FF453A</color>
-    <color name="success">#30D158</color>
+    <color name="surface">@color/charcoal_black</color>
+    <color name="danger">#FE5722</color>
+    <color name="success">@color/royal_blue_light</color>
 </resources>

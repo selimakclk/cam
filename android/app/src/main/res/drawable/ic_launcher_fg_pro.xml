@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 4 Royal Blue Vizör Braketi -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#105BFF"
+        android:strokeWidth="4.6"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M29,41 L29,29 L41,29 M67,29 L79,29 L79,41 M29,67 L29,79 L41,79 M67,79 L79,79 L79,67" />
+    <!-- Merkez Lens Halkası -->
+    <path
+        android:fillColor="#21232E"
+        android:strokeColor="#4D8AFF"
+        android:strokeWidth="3.2"
+        android:pathData="M54,36 A18,18 0 1,1 53.99,36 Z" />
+    <!-- İç Royal Blue Çekirdek -->
+    <path android:pathData="M54,43 A11,11 0 1,1 53.99,43 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="43"
+                android:startY="43"
+                android:endX="65"
+                android:endY="65"
+                android:startColor="#3D7EFF"
+                android:endColor="#105BFF"
+                android:type="linear" />
+        </aapt:attr>
+    </path>
+    <!-- Tangerine Orange AI Kayıt Noktası -->
+    <path
+        android:fillColor="#FE8500"
+        android:pathData="M69,36 A4.8,4.8 0 1,1 68.99,36 Z" />
+    <path
+        android:fillColor="#DDFFFFFF"
+        android:pathData="M50,49 A3.0,3.0 0 1,1 49.99,49 Z" />
+</vector>

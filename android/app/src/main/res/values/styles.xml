@@ -1,17 +1,44 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="AppTheme" parent="Theme.AppCompat.NoActionBar">
-        <item name="colorPrimary">@color/colorPrimary</item>
-        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
-        <item name="colorAccent">@color/colorAccent</item>
-        <item name="android:windowBackground">@color/black</item>
-        <item name="android:statusBarColor">#000000</item>
-        <item name="android:navigationBarColor">#000000</item>
+        <item name="colorPrimary">@color/royal_blue</item>
+        <item name="colorPrimaryDark">@color/charcoal_deep</item>
+        <item name="colorAccent">@color/royal_blue</item>
+        <item name="android:windowBackground">@color/charcoal_deep</item>
+        <item name="android:statusBarColor">@color/charcoal_deep</item>
+        <item name="android:navigationBarColor">@color/charcoal_deep</item>
+        <item name="alertDialogTheme">@style/CamAiDialogTheme</item>
+        <item name="android:alertDialogTheme">@style/CamAiDialogTheme</item>
     </style>
 
     <style name="AppTheme.NoActionBarLaunch" parent="AppTheme">
-        <item name="android:windowBackground">@color/black</item>
-        <item name="android:statusBarColor">#000000</item>
-        <item name="android:navigationBarColor">#000000</item>
+        <item name="android:windowBackground">@color/charcoal_deep</item>
+        <item name="android:statusBarColor">@color/charcoal_deep</item>
+        <item name="android:navigationBarColor">@color/charcoal_deep</item>
+    </style>
+
+    <style name="CamAiDialogTheme" parent="Theme.AppCompat.Dialog.Alert">
+        <item name="colorPrimary">@color/royal_blue</item>
+        <item name="colorAccent">@color/royal_blue_light</item>
+        <item name="android:windowBackground">@drawable/bg_dialog</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="buttonBarPositiveButtonStyle">@style/CamAiDialogBtnPositive</item>
+        <item name="buttonBarNegativeButtonStyle">@style/CamAiDialogBtnNegative</item>
+        <item name="buttonBarNeutralButtonStyle">@style/CamAiDialogBtnNeutral</item>
+    </style>
+
+    <style name="CamAiDialogBtnPositive" parent="Widget.AppCompat.Button.ButtonBar.AlertDialog">
+        <item name="android:textColor">@color/royal_blue_light</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="CamAiDialogBtnNegative" parent="Widget.AppCompat.Button.ButtonBar.AlertDialog">
+        <item name="android:textColor">@color/text_secondary</item>
+    </style>
+
+    <style name="CamAiDialogBtnNeutral" parent="Widget.AppCompat.Button.ButtonBar.AlertDialog">
+        <item name="android:textColor">@color/tangerine_orange</item>
+        <item name="android:textStyle">bold</item>
     </style>
 </resources>

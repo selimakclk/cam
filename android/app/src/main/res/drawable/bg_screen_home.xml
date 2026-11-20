@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Derin Charcoal Black temel zemin -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:angle="135"
+                android:startColor="#171923"
+                android:centerColor="#12141C"
+                android:endColor="#0D0F16"
+                android:type="linear" />
+        </shape>
+    </item>
+    <!-- Üst Royal Blue atmosferik ışıltı -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:centerX="0.22"
+                android:centerY="0.14"
+                android:gradientRadius="360dp"
+                android:startColor="#30105BFF"
+                android:endColor="#00105BFF"
+                android:type="radial" />
+        </shape>
+    </item>
+    <!-- Alt Tangerine Orange sıcak kenar ışıltısı -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:centerX="0.86"
+                android:centerY="0.88"
+                android:gradientRadius="320dp"
+                android:startColor="#24FE8500"
+                android:endColor="#00FE8500"
+                android:type="radial" />
+        </shape>
+    </item>
+</layer-list>

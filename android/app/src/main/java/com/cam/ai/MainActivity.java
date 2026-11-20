@@ -51,6 +51,8 @@ public class MainActivity extends AppCompatActivity {
     // Kamera HUD Elemanları
     private PreviewView previewView;
     private OverlayView overlayView;
+    private View statusDot;
+    private LinearLayout targetBanner;
     private TextView txtStatus;
     private TextView txtIpBadge;
     private TextView txtTargetStatus;
@@ -65,6 +67,7 @@ public class MainActivity extends AppCompatActivity {
     private Button btnEnrollDone;
     private Button btnMemory;
     private Button btnTorch;
+    private int lastBannerStyle = -1; // 0: idle, 1: blue locked, 2: orange occluded/lost
 
     // İzleyici HUD Elemanları
     private ImageView viewerStream;
@@ -174,7 +177,7 @@ public class MainActivity extends AppCompatActivity {
         public void onTorchChanged(boolean torchOn) {
             if (isFinishing() || isDestroyed()) return;
             btnTorch.setText(torchOn ? "Flaş: Açık" : "Flaş");
-            btnTorch.setTextColor(torchOn ? 0xFFFFD60A : 0xFFFFFFFF);
+            btnTorch.setTextColor(torchOn ? 0xFFFE8500 : 0xFFF5F7FA);
         }
 
         @Override
@@ -247,6 +250,8 @@ public class MainActivity extends AppCompatActivity {
         previewView = findViewById(R.id.previewView);
         previewView.setImplementationMode(PreviewView.ImplementationMode.PERFORMANCE);
         overlayView = findViewById(R.id.overlayView);
+        statusDot = findViewById(R.id.statusDot);
+        targetBanner = findViewById(R.id.targetBanner);
         txtStatus = findViewById(R.id.txtStatus);
         txtIpBadge = findViewById(R.id.txtIpBadge);
         txtTargetStatus = findViewById(R.id.txtTargetStatus);
@@ -272,14 +277,29 @@ public class MainActivity extends AppCompatActivity {
         editPassword = findViewById(R.id.editPassword);
         txtPinDots = findViewById(R.id.txtPinDots);
 
-        // Giriş Butonları
-        findViewById(R.id.btnRoleCamera).setOnClickListener(v -> onCameraRoleClicked());
-        findViewById(R.id.btnRoleViewer).setOnClickListener(v -> onViewerRoleClicked());
+        // Giriş Butonları + Anında Dokunma Geri Bildirimi
+        View btnRoleCamera = findViewById(R.id.btnRoleCamera);
+        View btnRoleViewer = findViewById(R.id.btnRoleViewer);
+        btnRoleCamera.setOnClickListener(v -> onCameraRoleClicked());
+        btnRoleViewer.setOnClickListener(v -> onViewerRoleClicked());
+        attachPressScale(btnRoleCamera, 0.97f);
+        attachPressScale(btnRoleViewer, 0.97f);
+
         btnCheckUpdate = findViewById(R.id.btnCheckUpdate);
         btnCheckUpdate.setText("Sürüm v" + GitHubUpdater.getCurrentVersionName(this) + " • Güncellemeyi Kontrol Et");
         btnCheckUpdate.setOnClickListener(v -> {
             if (githubUpdater != null) githubUpdater.checkInteractive(MainActivity.this);
         });
+        attachPressScale(btnCheckUpdate, 0.98f);
+        attachPressScale(btnMemory, 0.95f);
+        attachPressScale(btnTorch, 0.95f);
+        attachPressScale(btnEnrollTarget, 0.95f);
+        attachPressScale(btnNameTarget, 0.95f);
+        attachPressScale(btnUnlock, 0.95f);
+        attachPressScale(findViewById(R.id.btnStealth), 0.95f);
+        attachPressScale(findViewById(R.id.btnFlip), 0.95f);
+        attachPressScale(findViewById(R.id.btnBackMain), 0.95f);
+        attachPressScale(findViewById(R.id.btnDismissAlarm), 0.97f);
 
         // Kamera İçi Kontroller
         findViewById(R.id.btnStealth).setOnClickListener(v -> enterStealthMode());
@@ -369,6 +389,19 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    private void attachPressScale(View v, float pressedScale) {
+        if (v == null) return;
+        v.setOnTouchListener((view, event) -> {
+            int action = event.getActionMasked();
+            if (action == android.view.MotionEvent.ACTION_DOWN) {
+                view.animate().scaleX(pressedScale).scaleY(pressedScale).setDuration(70).start();
+            } else if (action == android.view.MotionEvent.ACTION_UP || action == android.view.MotionEvent.ACTION_CANCEL) {
+                view.animate().scaleX(1f).scaleY(1f).setDuration(130).start();
+            }
+            return false;
+        });
+    }
+
     private PersonDetectorEngine getActiveEngine() {
         CameraMonitorService svc = CameraMonitorService.getInstance();
         return (svc != null) ? svc.getPersonEngine() : null;
@@ -380,7 +413,8 @@ public class MainActivity extends AppCompatActivity {
         githubUpdater.checkSilently(this, (hasUpdate, latestVer) -> {
             if (!isFinishing() && !isDestroyed() && btnCheckUpdate != null && hasUpdate) {
                 btnCheckUpdate.setText("Yeni Sürüm Var (v" + latestVer + ") • Güncelle!");
-                btnCheckUpdate.setTextColor(0xFF30D158);
+                btnCheckUpdate.setBackgroundResource(R.drawable.btn_pill_orange);
+                btnCheckUpdate.setTextColor(0xFFFFA33B);
             }
         });
     }
@@ -577,18 +611,22 @@ public class MainActivity extends AppCompatActivity {
     private void updateTargetHud(PersonDetectorEngine.LockedState locked) {
         String newTargetText;
         int newVis;
+        int newBannerStyle;
         if (locked == null) {
             newTargetText = "Kişiye dokunarak kilitleyin";
             newVis = View.GONE;
+            newBannerStyle = 0;
         } else if (locked.lost) {
             String aiInfo = buildMemoryBadge(locked);
             newTargetText = aiInfo.isEmpty()
                     ? ("KAYIP: " + locked.displayLabel() + "!")
                     : ("KAYIP: " + locked.displayLabel() + "! (" + aiInfo + ")");
             newVis = View.VISIBLE;
+            newBannerStyle = 2;
         } else if (locked.isOccluded) {
             newTargetText = "Kısa Gizlenme: " + locked.displayLabel() + " (Bekleniyor...)";
             newVis = View.VISIBLE;
+            newBannerStyle = 2;
         } else {
             int pct = Math.round(locked.score * 100f);
             String badge;
@@ -598,6 +636,19 @@ public class MainActivity extends AppCompatActivity {
             else badge = "";
             newTargetText = "Kilitli: " + locked.displayLabel() + " (%" + pct + badge + ")";
             newVis = View.VISIBLE;
+            newBannerStyle = 1;
+        }
+        if (newBannerStyle != lastBannerStyle) {
+            lastBannerStyle = newBannerStyle;
+            if (targetBanner != null) {
+                targetBanner.setBackgroundResource(
+                        newBannerStyle == 1 ? R.drawable.bg_capsule_blue
+                                : (newBannerStyle == 2 ? R.drawable.bg_capsule_orange : R.drawable.bg_capsule));
+            }
+            if (statusDot != null) {
+                statusDot.setBackgroundResource(newBannerStyle == 2 ? R.drawable.dot_orange : R.drawable.dot_active);
+            }
+            txtTargetStatus.setTextColor(newBannerStyle == 2 ? 0xFFFFA33B : 0xFFF5F7FA);
         }
         if (!newTargetText.equals(lastTargetText)) {
             lastTargetText = newTargetText;
@@ -697,14 +748,13 @@ public class MainActivity extends AppCompatActivity {
         AlertDialog.Builder b = new AlertDialog.Builder(this);
         b.setTitle("360° Hızlı Kişi Tanıtımı");
         b.setMessage("Ön yüz, yan açı ve arka profil 9 saniyede otomatik öğrenilip kalıcı hafızaya kaydedilir.\nİsterseniz aşağıya isim yazın:");
-        final EditText input = new EditText(this);
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
-        input.setHint("İsteğe bağlı isim (Örn: Selim)");
+        final EditText input = createStyledDialogInput("İsteğe bağlı isim (Örn: Selim)",
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
         if (currentName != null && !currentName.trim().isEmpty()) {
             input.setText(currentName.trim());
             input.setSelection(input.getText().length());
         }
-        b.setView(input);
+        b.setView(wrapDialogInput(input));
         b.setPositiveButton("Tanıtımı Başlat", (d, w) -> {
             PersonDetectorEngine e = getActiveEngine();
             if (e == null) return;
@@ -752,14 +802,13 @@ public class MainActivity extends AppCompatActivity {
         AlertDialog.Builder b = new AlertDialog.Builder(this);
         b.setTitle("Kişiye İsim Ver (#" + personId + ")");
         b.setMessage("İsim verilen kişiler kalıcı hafızada saklanır; uygulama kapansa veya kıyafet değişse bile yüz/AI ile tanınır.");
-        final EditText input = new EditText(this);
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
-        input.setHint("Örn: Selim, Anne, Ev Sahibi");
+        final EditText input = createStyledDialogInput("Örn: Selim, Anne, Ev Sahibi",
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_WORDS);
         if (currentName != null && !currentName.trim().isEmpty()) {
             input.setText(currentName.trim());
             input.setSelection(input.getText().length());
         }
-        b.setView(input);
+        b.setView(wrapDialogInput(input));
         b.setPositiveButton("Kaydet", (d, w) -> {
             PersonDetectorEngine e = getActiveEngine();
             if (e == null) return;
@@ -1001,14 +1050,40 @@ public class MainActivity extends AppCompatActivity {
         };
     }
 
+    private EditText createStyledDialogInput(String hint, int inputType) {
+        float d = getResources().getDisplayMetrics().density;
+        EditText input = new EditText(this);
+        input.setInputType(inputType);
+        input.setHint(hint);
+        input.setTextColor(0xFFF5F7FA);
+        input.setHintTextColor(0xFF686F88);
+        input.setTextSize(15f);
+        input.setBackgroundResource(R.drawable.input_field);
+        int ph = Math.round(14 * d);
+        int pv = Math.round(12 * d);
+        input.setPadding(ph, pv, ph, pv);
+        return input;
+    }
+
+    private FrameLayout wrapDialogInput(EditText input) {
+        float d = getResources().getDisplayMetrics().density;
+        FrameLayout box = new FrameLayout(this);
+        int padH = Math.round(20 * d);
+        int padTop = Math.round(8 * d);
+        int padBot = Math.round(4 * d);
+        box.setPadding(padH, padTop, padH, padBot);
+        box.addView(input, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT));
+        return box;
+    }
+
     private void promptManualIpDialog() {
         AlertDialog.Builder b = new AlertDialog.Builder(this);
         b.setTitle("Kamera IP Adresi");
         b.setMessage("Kamera cihazının altında yazan IP adresini girin (Örn: 192.168.1.45):");
-        final EditText input = new EditText(this);
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        input.setHint("192.168.1.x");
-        b.setView(input);
+        final EditText input = createStyledDialogInput("192.168.1.x",
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        b.setView(wrapDialogInput(input));
         b.setPositiveButton("Bağlan", (d, w) -> {
             String ip = input.getText().toString().trim();
             if (!ip.isEmpty() && viewerClient != null) {
@@ -1032,6 +1107,7 @@ public class MainActivity extends AppCompatActivity {
         lastStatusText = "";
         lastTargetText = "";
         lastUnlockVisibility = View.GONE;
+        lastBannerStyle = -1;
         lastViewerTargetText = "";
         lastViewerUnlockVisibility = View.GONE;
         lastFpsTextTs = 0L;

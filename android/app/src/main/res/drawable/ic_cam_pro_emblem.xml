@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="72dp"
+    android:height="72dp"
+    android:viewportWidth="72"
+    android:viewportHeight="72">
+    <!-- Dış yumuşak Royal Blue hale -->
+    <path android:pathData="M36,4 A32,32 0 1,1 35.99,4 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="36"
+                android:centerY="36"
+                android:gradientRadius="32"
+                android:startColor="#3A105BFF"
+                android:endColor="#00105BFF"
+                android:type="radial" />
+        </aapt:attr>
+    </path>
+    <!-- Charcoal Black ana lens gövdesi -->
+    <path
+        android:fillColor="#181A24"
+        android:strokeColor="#2EFFFFFF"
+        android:strokeWidth="1.2"
+        android:pathData="M36,10 A26,26 0 1,1 35.99,10 Z" />
+    <!-- 4 Hassas Vizör Köşesi (Royal Blue) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#105BFF"
+        android:strokeWidth="2.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M21,28 L21,21 L28,21 M44,21 L51,21 L51,28 M21,44 L21,51 L28,51 M44,51 L51,51 L51,44" />
+    <!-- Merkez Optik Lens Halkası -->
+    <path
+        android:fillColor="#21232E"
+        android:strokeColor="#4D8AFF"
+        android:strokeWidth="2.0"
+        android:pathData="M36,24.5 A11.5,11.5 0 1,1 35.99,24.5 Z" />
+    <!-- İç Royal Blue Optik Çekirdek -->
+    <path android:pathData="M36,29 A7,7 0 1,1 35.99,29 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="29"
+                android:startY="29"
+                android:endX="43"
+                android:endY="43"
+                android:startColor="#3D7EFF"
+                android:endColor="#105BFF"
+                android:type="linear" />
+        </aapt:attr>
+    </path>
+    <!-- Tangerine Orange Optik Parlama & Canlı Kayıt Noktası -->
+    <path
+        android:fillColor="#FE8500"
+        android:pathData="M45.5,24.5 A3.0,3.0 0 1,1 45.49,24.5 Z" />
+    <path
+        android:fillColor="#CCFFFFFF"
+        android:pathData="M33.5,32.5 A2.0,2.0 0 1,1 33.49,32.5 Z" />
+</vector>

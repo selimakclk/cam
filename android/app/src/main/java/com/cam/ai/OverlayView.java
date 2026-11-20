@@ -25,7 +25,10 @@ public class OverlayView extends View {
 
     private final Paint idleBracketPaint = new Paint();
     private final Paint idleDashPaint = new Paint();
+    private final Paint lockedGlowPaint = new Paint();
     private final Paint lockedBracketPaint = new Paint();
+    private final Paint occludedBracketPaint = new Paint();
+    private final Paint lostGlowPaint = new Paint();
     private final Paint lostBracketPaint = new Paint();
     private final Paint crossPaint = new Paint();
     private final Paint tagBgPaint = new Paint();
@@ -69,50 +72,72 @@ public class OverlayView extends View {
     }
 
     private void initPaints() {
-        idleBracketPaint.setColor(Color.parseColor("#CCFFFFFF"));
+        idleBracketPaint.setColor(Color.parseColor("#E0F5F7FA"));
         idleBracketPaint.setStyle(Paint.Style.STROKE);
         idleBracketPaint.setStrokeWidth(4.5f);
         idleBracketPaint.setStrokeCap(Paint.Cap.ROUND);
         idleBracketPaint.setAntiAlias(true);
 
-        idleDashPaint.setColor(Color.parseColor("#28FFFFFF"));
+        idleDashPaint.setColor(Color.parseColor("#18105BFF"));
         idleDashPaint.setStyle(Paint.Style.FILL);
         idleDashPaint.setAntiAlias(true);
 
-        lockedBracketPaint.setColor(Color.parseColor("#30D158")); // Apple Pro Green
+        // Royal Blue (#105BFF) Pro Kilit Vizörü + yumuşak dış ışıltı
+        lockedGlowPaint.setColor(Color.parseColor("#4D105BFF"));
+        lockedGlowPaint.setStyle(Paint.Style.STROKE);
+        lockedGlowPaint.setStrokeWidth(16f);
+        lockedGlowPaint.setStrokeCap(Paint.Cap.ROUND);
+        lockedGlowPaint.setAntiAlias(true);
+
+        lockedBracketPaint.setColor(Color.parseColor("#105BFF"));
         lockedBracketPaint.setStyle(Paint.Style.STROKE);
         lockedBracketPaint.setStrokeWidth(7.5f);
         lockedBracketPaint.setStrokeCap(Paint.Cap.ROUND);
         lockedBracketPaint.setAntiAlias(true);
 
-        lostBracketPaint.setColor(Color.parseColor("#FF453A")); // Apple Alarm Red
+        // Tangerine Orange (#FE8500) Kısa Gizlenme / Bekleme Vizörü
+        occludedBracketPaint.setColor(Color.parseColor("#FE8500"));
+        occludedBracketPaint.setStyle(Paint.Style.STROKE);
+        occludedBracketPaint.setStrokeWidth(7.5f);
+        occludedBracketPaint.setStrokeCap(Paint.Cap.ROUND);
+        occludedBracketPaint.setAntiAlias(true);
+
+        // Tangerine-Crimson Hedef Kayıp Vizörü
+        lostGlowPaint.setColor(Color.parseColor("#4DFE6800"));
+        lostGlowPaint.setStyle(Paint.Style.STROKE);
+        lostGlowPaint.setStrokeWidth(16f);
+        lostGlowPaint.setStrokeCap(Paint.Cap.ROUND);
+        lostGlowPaint.setAntiAlias(true);
+
+        lostBracketPaint.setColor(Color.parseColor("#FE6800"));
         lostBracketPaint.setStyle(Paint.Style.STROKE);
         lostBracketPaint.setStrokeWidth(8f);
         lostBracketPaint.setStrokeCap(Paint.Cap.ROUND);
         lostBracketPaint.setAntiAlias(true);
 
-        crossPaint.setColor(Color.parseColor("#30D158"));
+        crossPaint.setColor(Color.parseColor("#4D8AFF"));
         crossPaint.setStyle(Paint.Style.STROKE);
-        crossPaint.setStrokeWidth(3f);
+        crossPaint.setStrokeWidth(3.2f);
         crossPaint.setStrokeCap(Paint.Cap.ROUND);
         crossPaint.setAntiAlias(true);
 
-        tagBgPaint.setColor(Color.parseColor("#CC141418"));
+        // Charcoal Black (#21232E) cam etiket yüzeyi
+        tagBgPaint.setColor(Color.parseColor("#DC21232E"));
         tagBgPaint.setStyle(Paint.Style.FILL);
         tagBgPaint.setAntiAlias(true);
 
-        tagBorderPaint.setColor(Color.parseColor("#33FFFFFF"));
+        tagBorderPaint.setColor(Color.parseColor("#38FFFFFF"));
         tagBorderPaint.setStyle(Paint.Style.STROKE);
-        tagBorderPaint.setStrokeWidth(2f);
+        tagBorderPaint.setStrokeWidth(2.2f);
         tagBorderPaint.setAntiAlias(true);
 
-        tagTextPaint.setColor(Color.WHITE);
-        tagTextPaint.setTextSize(30f);
+        tagTextPaint.setColor(Color.parseColor("#F5F7FA"));
+        tagTextPaint.setTextSize(29f);
         tagTextPaint.setFakeBoldText(true);
         tagTextPaint.setAntiAlias(true);
 
         ringPaint.setStyle(Paint.Style.STROKE);
-        ringPaint.setStrokeWidth(5f);
+        ringPaint.setStrokeWidth(5.5f);
         ringPaint.setAntiAlias(true);
     }
 
@@ -329,8 +354,8 @@ public class OverlayView extends View {
                             ? ("KİLİTLİ • " + snapLocked.name.trim() + " • %" + pct + aiBadge)
                             : ("KİLİTLİ #" + snapLocked.id + " • %" + pct + aiBadge);
                 }
-                drawLockedViewfinder(canvas, tempRect, snapLocked.lost, label, now);
-                if (snapLocked.lost) needContinueAnim = true;
+                drawLockedViewfinder(canvas, tempRect, snapLocked.lost, snapLocked.isOccluded, label, now);
+                if (snapLocked.lost || snapLocked.isOccluded) needContinueAnim = true;
             } else {
                 personCount = persons.size();
                 for (int i = 0; i < personCount; i++) {
@@ -358,7 +383,7 @@ public class OverlayView extends View {
                 float p = (float) elapsed / RING_DURATION_MS;
                 float radius = 64f - 24f * p;
                 int alpha = Math.round((1f - p) * 255f);
-                ringPaint.setColor(ringIsWarning ? Color.parseColor("#FFD60A") : Color.WHITE);
+                ringPaint.setColor(ringIsWarning ? Color.parseColor("#FE8500") : Color.parseColor("#105BFF"));
                 ringPaint.setAlpha(alpha);
                 canvas.drawCircle(ringX, ringY, radius, ringPaint);
                 needContinueAnim = true;
@@ -373,7 +398,7 @@ public class OverlayView extends View {
     }
 
     private void drawIdlePerson(Canvas canvas, RectF r, String label) {
-        canvas.drawRoundRect(r, 12f, 12f, idleDashPaint);
+        canvas.drawRoundRect(r, 14f, 14f, idleDashPaint);
 
         float corner = Math.max(18f, Math.min(44f, Math.min(r.width(), r.height()) * 0.20f));
         fillCornerPath(r, corner);
@@ -383,28 +408,44 @@ public class OverlayView extends View {
         float tagTop = Math.max(8f, r.top - 48f);
         float tagLeft = Math.max(8f, Math.min(getWidth() - textW - 32f, r.left));
         tempTagRect.set(tagLeft, tagTop, tagLeft + textW + 24f, tagTop + 38f);
-        canvas.drawRoundRect(tempTagRect, 12f, 12f, tagBgPaint);
-        canvas.drawRoundRect(tempTagRect, 12f, 12f, tagBorderPaint);
+        tagBgPaint.setColor(Color.parseColor("#DC21232E"));
+        tagBorderPaint.setColor(Color.parseColor("#38FFFFFF"));
+        canvas.drawRoundRect(tempTagRect, 14f, 14f, tagBgPaint);
+        canvas.drawRoundRect(tempTagRect, 14f, 14f, tagBorderPaint);
         canvas.drawText(label, tagLeft + 12f, tagTop + 28f, tagTextPaint);
     }
 
-    private void drawLockedViewfinder(Canvas canvas, RectF r, boolean lost, String label, long now) {
-        Paint bp = lost ? lostBracketPaint : lockedBracketPaint;
+    private void drawLockedViewfinder(Canvas canvas, RectF r, boolean lost, boolean occluded, String label, long now) {
+        Paint bp;
+        Paint glow;
         if (lost) {
-            int pulseAlpha = (int) (140 + 115 * Math.sin(now * 0.015));
-            bp.setAlpha(Math.max(80, Math.min(255, pulseAlpha)));
+            bp = lostBracketPaint;
+            glow = lostGlowPaint;
+            int pulseAlpha = (int) (145 + 110 * Math.sin(now * 0.015));
+            bp.setAlpha(Math.max(90, Math.min(255, pulseAlpha)));
+            glow.setAlpha(Math.max(40, Math.min(100, pulseAlpha / 3)));
+        } else if (occluded) {
+            bp = occludedBracketPaint;
+            glow = lostGlowPaint;
+            bp.setAlpha(245);
+            glow.setAlpha(65);
         } else {
+            bp = lockedBracketPaint;
+            glow = lockedGlowPaint;
             bp.setAlpha(255);
+            glow.setAlpha(85);
         }
 
         float corner = Math.max(24f, Math.min(60f, Math.min(r.width(), r.height()) * 0.25f));
         fillCornerPath(r, corner);
+        canvas.drawPath(tempCornerPath, glow);
         canvas.drawPath(tempCornerPath, bp);
 
         float cx = r.centerX();
         float cy = r.centerY();
         float cs = 18f;
-        crossPaint.setColor(lost ? Color.parseColor("#FF453A") : Color.parseColor("#30D158"));
+        crossPaint.setColor(lost ? Color.parseColor("#FE6800")
+                : (occluded ? Color.parseColor("#FE8500") : Color.parseColor("#4D8AFF")));
         canvas.drawLine(cx - cs, cy, cx + cs, cy, crossPaint);
         canvas.drawLine(cx, cy - cs, cx, cy + cs, crossPaint);
 
@@ -414,10 +455,18 @@ public class OverlayView extends View {
         float tagTop = Math.max(12f, r.top - 52f);
         tempTagRect.set(tagLeft, tagTop, tagLeft + tagW, tagTop + 42f);
 
-        tagBgPaint.setColor(lost ? Color.parseColor("#DDFF3B30") : Color.parseColor("#CC141418"));
-        canvas.drawRoundRect(tempTagRect, 14f, 14f, tagBgPaint);
-        tagBgPaint.setColor(Color.parseColor("#CC141418"));
-        canvas.drawRoundRect(tempTagRect, 14f, 14f, tagBorderPaint);
+        if (lost) {
+            tagBgPaint.setColor(Color.parseColor("#E8FE6800"));
+            tagBorderPaint.setColor(Color.parseColor("#88FFFFFF"));
+        } else if (occluded) {
+            tagBgPaint.setColor(Color.parseColor("#E62A1F16"));
+            tagBorderPaint.setColor(Color.parseColor("#CCFE8500"));
+        } else {
+            tagBgPaint.setColor(Color.parseColor("#E31A2238"));
+            tagBorderPaint.setColor(Color.parseColor("#B3105BFF"));
+        }
+        canvas.drawRoundRect(tempTagRect, 16f, 16f, tagBgPaint);
+        canvas.drawRoundRect(tempTagRect, 16f, 16f, tagBorderPaint);
         canvas.drawText(label, tagLeft + 16f, tagTop + 31f, tagTextPaint);
     }
 
