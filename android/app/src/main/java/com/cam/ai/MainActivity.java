@@ -594,8 +594,7 @@ public class MainActivity extends AppCompatActivity {
                 PersonMemoryStore.ProfileSummary p = profiles.get(i);
                 items[i] = p.displayLabel()
                         + "  •  Yüz: " + p.faceCount
-                        + "  •  Derin AI: " + p.deepCount
-                        + "  •  İmza: " + p.sigCount;
+                        + "  •  Açı Hafızası: " + p.sigCount;
             }
             builder.setItems(items, (dialog, which) -> showProfileActionDialog(profiles.get(which)));
             builder.setNeutralButton("Tümünü Temizle", (d, w) -> new AlertDialog.Builder(this)

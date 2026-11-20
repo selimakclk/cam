@@ -29,12 +29,11 @@ public class PersonMemoryStore {
     private static final int FORMAT_VERSION = 2;
 
     public static final int MAX_PROFILES = 32;
-    public static final int MAX_SIG_PER_PROFILE = 10;
-    public static final int MAX_DEEP_PER_PROFILE = 8;
+    public static final int MAX_SIG_PER_PROFILE = 12;
+    public static final int MAX_DEEP_PER_PROFILE = 0;
     public static final int MAX_FACE_PER_PROFILE = 8;
 
-    public static final long AI_PROFILE_TTL_MS = 7L * 24L * 3600L * 1000L; // 7 gün (Derin AI veya Yüz içeren)
-    public static final long TRANSIENT_PROFILE_TTL_MS = 15L * 60L * 1000L; // 15 dk (Sadece hızlı renk/desen)
+    public static final long SESSION_PROFILE_TTL_MS = 10L * 60L * 1000L; // 10 dakika aktif oda hafızası (isimsiz)
 
     public static class PersonProfile {
         public int id;
@@ -154,7 +153,8 @@ public class PersonMemoryStore {
                     readVectorList(in, p.faceGallery, MAX_FACE_PER_PROFILE, 1024);
 
                     if (p.id > maxId) maxId = p.id;
-                    if (!isExpired(p, now) && (!p.sigGallery.isEmpty() || !p.deepBodyGallery.isEmpty() || !p.faceGallery.isEmpty())) {
+                    // Uygulama açılışında yalnızca kullanıcı tarafından İSİMLENDİRİLMİŞ kalıcı profilleri yükle (dünden kalan hayalet ID'leri engeller!)
+                    if (p.isNamed() && (!p.sigGallery.isEmpty() || !p.faceGallery.isEmpty())) {
                         res.profiles.add(p);
                     }
                 }
@@ -174,10 +174,7 @@ public class PersonMemoryStore {
         if (p == null) return true;
         if (p.isNamed()) return false; // İsimlendirilmiş kişiler asla otomatik silinmez
         long age = Math.max(0L, now - p.lastSeen);
-        if (p.hasNeuralData()) {
-            return age > AI_PROFILE_TTL_MS;
-        }
-        return age > TRANSIENT_PROFILE_TTL_MS;
+        return age > SESSION_PROFILE_TTL_MS;
     }
 
     public void saveDebouncedAsync(List<PersonProfile> snapshot, int nextTrackId) {
@@ -220,19 +217,25 @@ public class PersonMemoryStore {
                     out.writeInt(FORMAT_VERSION);
                     out.writeInt(nextTrackId);
 
-                    int limit = Math.min(MAX_PROFILES, profiles.size());
+                    // Diske yalnızca İSİMLENDİRİLMİŞ kalıcı profilleri yaz (sıfır gereksiz I/O + sıfır hayalet profil!)
+                    List<PersonProfile> persistable = new ArrayList<>();
+                    for (PersonProfile p : profiles) {
+                        if (p.isNamed() && persistable.size() < MAX_PROFILES) {
+                            persistable.add(p);
+                        }
+                    }
+                    int limit = persistable.size();
                     out.writeInt(limit);
                     for (int i = 0; i < limit; i++) {
-                        PersonProfile p = profiles.get(i);
+                        PersonProfile p = persistable.get(i);
                         out.writeInt(p.id);
-                        boolean hasName = p.isNamed();
-                        out.writeBoolean(hasName);
-                        if (hasName) out.writeUTF(p.name.trim());
+                        out.writeBoolean(true);
+                        out.writeUTF(p.name.trim());
                         out.writeLong(p.firstSeen);
                         out.writeLong(p.lastSeen);
 
                         writeVectorList(out, p.sigGallery, MAX_SIG_PER_PROFILE);
-                        writeVectorList(out, p.deepBodyGallery, MAX_DEEP_PER_PROFILE);
+                        writeVectorList(out, java.util.Collections.emptyList(), 0);
                         writeVectorList(out, p.faceGallery, MAX_FACE_PER_PROFILE);
                     }
                     out.flush();

@@ -13,15 +13,12 @@ import android.util.Log;
 import com.google.mediapipe.framework.image.BitmapImageBuilder;
 import com.google.mediapipe.framework.image.MPImage;
 import com.google.mediapipe.tasks.components.containers.Detection;
-import com.google.mediapipe.tasks.components.containers.Embedding;
 import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint;
 import com.google.mediapipe.tasks.core.BaseOptions;
 import com.google.mediapipe.tasks.core.Delegate;
 import com.google.mediapipe.tasks.vision.core.RunningMode;
 import com.google.mediapipe.tasks.vision.facedetector.FaceDetector;
 import com.google.mediapipe.tasks.vision.facedetector.FaceDetectorResult;
-import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedder;
-import com.google.mediapipe.tasks.vision.imageembedder.ImageEmbedderResult;
 import org.tensorflow.lite.Interpreter;
 import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
@@ -33,48 +30,38 @@ import java.nio.channels.FileChannel;
 import java.util.List;
 
 /**
- * Cihaz İçi Hibrit Derin Yapay Zeka Kimlik Motoru:
- *  1) MediaPipe MobileNetV3-Small (1024-D L2-normalize Derin Vücut/Kıyafet Re-ID Gömme)
- *  2) MediaPipe BlazeFace Short-Range (Yüz & Göz Hizalama Noktaları Tespiti)
- *  3) Google LiteRT MobileFaceNet (192-D L2-normalize Biyometrik Yüz Kimlik Vektörü)
+ * Hafif & Asenkron Biyometrik Yüz Tanıma Motoru (v2.5):
+ *  - MediaPipe BlazeFace Short-Range (229 KB) ile yüksek güvenli ön yüz & göz hizalama tespiti.
+ *  - Google LiteRT MobileFaceNet (192-D L2-normalize yüz vektörü).
  *
- * Sıfır per-kare bellek tahsisi (yeniden kullanılabilir Bitmap + Direct ByteBuffer) ile
- * kamera akıcılığını bozmadan yüksek doğrulukta tanıma sağlar.
+ * Ana SSD insan tespit thread'ini ASLA bloklamaz; ayrı arka plan thread'inde çalışarak
+ * kıyafet değişiminde ve isimli kalıcı hafızada ekstra doğruluk sağlar.
  */
 public class NeuralIdentityEngine {
 
     private static final String TAG = "NeuralIdentityEngine";
-    private static final String BODY_EMBEDDER_MODEL = "mobilenet_v3_small.tflite";
     private static final String FACE_DETECTOR_MODEL = "blaze_face_short_range.tflite";
     private static final String FACE_EMBEDDER_MODEL = "mobilefacenet.tflite";
 
-    private static final int BODY_CROP_SIZE = 224;
-    private static final int HEAD_CROP_SIZE = 256;
+    private static final int HEAD_CROP_SIZE = 224;
     private static final int FACE_INPUT_SIZE = 112;
-    private static final float MIN_FACE_SCORE = 0.54f;
-    private static final float MIN_FACE_PX = 20f;
+    private static final float MIN_FACE_SCORE = 0.62f; // Yalnızca net yüzler (bulanık yan profiller hafızayı kirletmez)
+    private static final float MIN_FACE_PX = 24f;
 
-    public static class NeuralFeatures {
-        public float[] bodyEmbedding; // 1024-D unit-norm MobileNetV3
+    public static class FaceResult {
         public float[] faceEmbedding; // 192-D unit-norm MobileFaceNet
         public float faceScore;
+        public boolean isFrontal;
     }
 
-    private ImageEmbedder bodyEmbedder;
     private FaceDetector faceDetector;
     private Interpreter faceInterpreter;
     private int faceEmbedDim = 192;
-    private int bodyEmbedDim = 1024;
 
-    private volatile boolean bodyReady = false;
     private volatile boolean faceReady = false;
     private volatile boolean closed = false;
 
-    private final Object neuralLock = new Object();
-
-    // Yeniden kullanılabilir sıfır-GC kırpma & giriş tamponları (yalnızca neuralLock altında)
-    private final Bitmap bodyCropBitmap = Bitmap.createBitmap(BODY_CROP_SIZE, BODY_CROP_SIZE, Bitmap.Config.ARGB_8888);
-    private final Canvas bodyCropCanvas = new Canvas(bodyCropBitmap);
+    private final Object faceLock = new Object();
 
     private final Bitmap headCropBitmap = Bitmap.createBitmap(HEAD_CROP_SIZE, HEAD_CROP_SIZE, Bitmap.Config.ARGB_8888);
     private final Canvas headCropCanvas = new Canvas(headCropBitmap);
@@ -93,29 +80,7 @@ public class NeuralIdentityEngine {
     private final Matrix alignMatrix = new Matrix();
 
     public NeuralIdentityEngine(Context context) {
-        initBodyEmbedder(context);
         initFacePipeline(context);
-    }
-
-    private void initBodyEmbedder(Context context) {
-        try {
-            BaseOptions baseOpts = BaseOptions.builder()
-                    .setModelAssetPath(BODY_EMBEDDER_MODEL)
-                    .setDelegate(Delegate.CPU)
-                    .build();
-            ImageEmbedder.ImageEmbedderOptions opts = ImageEmbedder.ImageEmbedderOptions.builder()
-                    .setBaseOptions(baseOpts)
-                    .setRunningMode(RunningMode.IMAGE)
-                    .setL2Normalize(true)
-                    .setQuantize(false)
-                    .build();
-            bodyEmbedder = ImageEmbedder.createFromOptions(context, opts);
-            bodyReady = true;
-            Log.i(TAG, "MobileNetV3-Small Derin Re-ID motoru hazır.");
-        } catch (Throwable t) {
-            bodyReady = false;
-            Log.w(TAG, "Derin Re-ID başlatılamadı (yedek moda düşülüyor): " + t.getMessage());
-        }
     }
 
     private void initFacePipeline(Context context) {
@@ -127,15 +92,15 @@ public class NeuralIdentityEngine {
             FaceDetector.FaceDetectorOptions fdOpts = FaceDetector.FaceDetectorOptions.builder()
                     .setBaseOptions(fdBase)
                     .setRunningMode(RunningMode.IMAGE)
-                    .setMinDetectionConfidence(0.50f)
+                    .setMinDetectionConfidence(0.56f)
                     .setMinSuppressionThreshold(0.30f)
                     .build();
             faceDetector = FaceDetector.createFromOptions(context, fdOpts);
 
             ByteBuffer modelBuf = loadAssetModelBuffer(context, FACE_EMBEDDER_MODEL);
             Interpreter.Options tfliteOpts = new Interpreter.Options();
-            int threads = Math.min(4, Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
-            tfliteOpts.setNumThreads(threads);
+            // Arka plan yüz motoru ana SSD'den CPU çalmasın diye 2 iş parçacığı ile sınırlı
+            tfliteOpts.setNumThreads(2);
             tfliteOpts.setUseXNNPACK(true);
             faceInterpreter = new Interpreter(modelBuf, tfliteOpts);
 
@@ -145,10 +110,10 @@ public class NeuralIdentityEngine {
                 faceOutputBuf = new float[1][faceEmbedDim];
             }
             faceReady = true;
-            Log.i(TAG, "BlazeFace + MobileFaceNet (" + faceEmbedDim + "-D) biyometrik yüz motoru hazır.");
+            Log.i(TAG, "Asenkron BlazeFace + MobileFaceNet (" + faceEmbedDim + "-D) yüz motoru hazır.");
         } catch (Throwable t) {
             faceReady = false;
-            Log.w(TAG, "Yüz tanıma motoru başlatılamadı (vücut Re-ID ile devam): " + t.getMessage());
+            Log.w(TAG, "Yüz tanıma motoru başlatılamadı (hızlı Re-ID ile devam): " + t.getMessage());
             closeQuietlyFace();
         }
     }
@@ -174,10 +139,6 @@ public class NeuralIdentityEngine {
         }
     }
 
-    public boolean isBodyReady() {
-        return bodyReady && !closed;
-    }
-
     public boolean isFaceReady() {
         return faceReady && !closed;
     }
@@ -186,75 +147,29 @@ public class NeuralIdentityEngine {
         return faceEmbedDim;
     }
 
-    public int getBodyEmbedDim() {
-        return bodyEmbedDim;
-    }
-
     public String getActiveEnginesSummary() {
-        if (bodyReady && faceReady) return "SSD + MobileNetV3 + BlazeFace + MobileFaceNet";
-        if (bodyReady) return "SSD + MobileNetV3 Derin Re-ID";
-        if (faceReady) return "SSD + BlazeFace + MobileFaceNet";
-        return "SSD + Hızlı 129-D İmza";
+        return faceReady
+                ? "Hızlı SSD-300 + 129-D Re-ID + Asenkron Yüz AI"
+                : "Hızlı SSD-300 + 129-D Çok-İpuculu Re-ID";
     }
 
-    /**
-     * Verilen kişi kutusundan derin vücut (MobileNetV3) ve/veya biyometrik yüz (MobileFaceNet) vektörleri çıkarır.
-     */
-    public NeuralFeatures extractFeatures(Bitmap fullBitmap, float nx, float ny, float nw, float nh,
-                                          boolean wantBody, boolean wantFace) {
-        NeuralFeatures out = new NeuralFeatures();
-        if (closed || fullBitmap == null || fullBitmap.isRecycled()) return out;
-        if ((!wantBody || !bodyReady) && (!wantFace || !faceReady)) return out;
+    public FaceResult extractFace(Bitmap fullBitmap, float nx, float ny, float nw, float nh) {
+        FaceResult out = new FaceResult();
+        if (closed || !faceReady || fullBitmap == null || fullBitmap.isRecycled()) return out;
 
-        synchronized (neuralLock) {
-            if (closed || fullBitmap.isRecycled()) return out;
-            if (wantBody && bodyReady && bodyEmbedder != null) {
-                out.bodyEmbedding = extractBodyEmbeddingLocked(fullBitmap, nx, ny, nw, nh);
+        synchronized (faceLock) {
+            if (closed || !faceReady || faceDetector == null || faceInterpreter == null || fullBitmap.isRecycled()) {
+                return out;
             }
-            if (wantFace && faceReady && faceDetector != null && faceInterpreter != null) {
-                extractFaceEmbeddingLocked(fullBitmap, nx, ny, nw, nh, out);
-            }
+            extractFaceLocked(fullBitmap, nx, ny, nw, nh, out);
         }
         return out;
     }
 
-    private float[] extractBodyEmbeddingLocked(Bitmap full, float nx, float ny, float nw, float nh) {
-        int bw = full.getWidth();
-        int bh = full.getHeight();
-        // Arka plan kenar gürültüsünü azaltmak için yatayda %7 içten kırp, dikeyde tam vücut/gövde al
-        int x0 = Math.max(0, Math.min(bw - 4, Math.round((nx + nw * 0.07f) * bw)));
-        int x1 = Math.max(x0 + 4, Math.min(bw, Math.round((nx + nw * 0.93f) * bw)));
-        int y0 = Math.max(0, Math.min(bh - 4, Math.round((ny + nh * 0.02f) * bh)));
-        int y1 = Math.max(y0 + 4, Math.min(bh, Math.round((ny + nh * 0.96f) * bh)));
-        if (x1 - x0 < 12 || y1 - y0 < 16) return null;
-
-        srcRect.set(x0, y0, x1, y1);
-        dstRect.set(0, 0, BODY_CROP_SIZE, BODY_CROP_SIZE);
-        bodyCropCanvas.drawBitmap(full, srcRect, dstRect, bilinearPaint);
-
-        try {
-            // NOT: bodyCropBitmap yeniden kullanıldığı için mp.close() ÇAĞRILMAMALIDIR (mp.close() bitmap.recycle() çağırır!).
-            MPImage mp = new BitmapImageBuilder(bodyCropBitmap).build();
-            ImageEmbedderResult res = bodyEmbedder.embed(mp);
-            if (res == null || res.embeddingResult() == null || res.embeddingResult().embeddings().isEmpty()) {
-                return null;
-            }
-            Embedding emb = res.embeddingResult().embeddings().get(0);
-            float[] vec = emb.floatEmbedding();
-            if (vec == null || vec.length == 0) return null;
-            bodyEmbedDim = vec.length;
-            return l2NormalizeCopy(vec);
-        } catch (Throwable t) {
-            Log.w(TAG, "Body embedding hatası: " + t.getMessage());
-            return null;
-        }
-    }
-
-    private void extractFaceEmbeddingLocked(Bitmap full, float nx, float ny, float nw, float nh, NeuralFeatures out) {
+    private void extractFaceLocked(Bitmap full, float nx, float ny, float nw, float nh, FaceResult out) {
         int bw = full.getWidth();
         int bh = full.getHeight();
 
-        // Kişinin üst yarısı (yakın çekim portrelerde daha geniş oran) içinde yüz ara
         float aspect = nw / Math.max(0.01f, nh);
         float headFracH = (aspect > 0.65f) ? 0.78f : 0.54f;
 
@@ -271,7 +186,6 @@ public class NeuralIdentityEngine {
         int cropH = hy1 - hy0;
         if (cropW < 24 || cropH < 24) return;
 
-        // Oranı bozmadan (letterbox) 256x256 tuvale çiz -> BlazeFace yamulmamış net yüz görür
         float scale = Math.min((float) HEAD_CROP_SIZE / cropW, (float) HEAD_CROP_SIZE / cropH);
         int drawW = Math.max(1, Math.round(cropW * scale));
         int drawH = Math.max(1, Math.round(cropH * scale));
@@ -284,7 +198,7 @@ public class NeuralIdentityEngine {
         headCropCanvas.drawBitmap(full, srcRect, dstRect, bilinearPaint);
 
         try {
-            // NOT: headCropBitmap yeniden kullanıldığı için headMp.close() ÇAĞRILMAMALIDIR!
+            // NOT: headCropBitmap yeniden kullanıldığı için headMp.close() çağrılmaz.
             MPImage headMp = new BitmapImageBuilder(headCropBitmap).build();
             FaceDetectorResult fdRes = faceDetector.detect(headMp);
             if (fdRes == null || fdRes.detections() == null || fdRes.detections().isEmpty()) {
@@ -293,7 +207,7 @@ public class NeuralIdentityEngine {
 
             float personLeftPx = nx * bw;
             float personRightPx = (nx + nw) * bw;
-            float personMarginPx = nw * bw * 0.12f;
+            float personMarginPx = nw * bw * 0.10f;
 
             Detection bestDet = null;
             float bestScore = MIN_FACE_SCORE;
@@ -313,7 +227,6 @@ public class NeuralIdentityEngine {
                 float fh = fy1 - fy0;
                 if (fw < MIN_FACE_PX || fh < MIN_FACE_PX) continue;
 
-                // Komşu kişinin yüzünü yanlışlıkla almamak için kişinin yatay sınırlarını doğrula
                 float fcx = (fx0 + fx1) * 0.5f;
                 if (fcx < personLeftPx - personMarginPx || fcx > personRightPx + personMarginPx) {
                     continue;
@@ -326,29 +239,33 @@ public class NeuralIdentityEngine {
 
             if (bestDet == null || bestFullBox == null) return;
 
-            // Göz noktalarıyla baş eğimi düzeltme (Eye-Alignment)
             float angleDeg = 0f;
+            boolean frontal = false;
             if (bestDet.keypoints().isPresent()) {
                 List<NormalizedKeypoint> kps = bestDet.keypoints().get();
-                if (kps.size() >= 2) {
+                if (kps.size() >= 3) {
                     NormalizedKeypoint e0 = kps.get(0);
                     NormalizedKeypoint e1 = kps.get(1);
+                    NormalizedKeypoint nose = kps.get(2);
                     float xA = e0.x() * HEAD_CROP_SIZE;
                     float yA = e0.y() * HEAD_CROP_SIZE;
                     float xB = e1.x() * HEAD_CROP_SIZE;
                     float yB = e1.y() * HEAD_CROP_SIZE;
                     float dx = (xB >= xA) ? (xB - xA) : (xA - xB);
                     float dy = (xB >= xA) ? (yB - yA) : (yA - yB);
-                    if (dx > 6f) {
+                    if (dx > 8f) {
                         float deg = (float) Math.toDegrees(Math.atan2(dy, dx));
-                        if (Math.abs(deg) <= 40f) {
-                            angleDeg = deg;
-                        }
+                        if (Math.abs(deg) <= 35f) angleDeg = deg;
+                        // Burun iki göz arasında simetrikse gerçekten ön yüzdür (yan profil değil!)
+                        float minEyeX = Math.min(e0.x(), e1.x());
+                        float maxEyeX = Math.max(e0.x(), e1.x());
+                        float eyeSpan = Math.max(1e-4f, maxEyeX - minEyeX);
+                        float noseRatio = (nose.x() - minEyeX) / eyeSpan;
+                        frontal = (noseRatio >= 0.18f && noseRatio <= 0.82f);
                     }
                 }
             }
 
-            // Yüksek çözünürlüklü tam kareden hizalanmış 112x112 yüz kırp
             float fcx = bestFullBox.centerX();
             float fcy = bestFullBox.centerY();
             float side = Math.max(bestFullBox.width(), bestFullBox.height()) * 1.24f;
@@ -364,7 +281,6 @@ public class NeuralIdentityEngine {
             alignMatrix.postTranslate(FACE_INPUT_SIZE * 0.5f, FACE_INPUT_SIZE * 0.5f);
             faceInputCanvas.drawBitmap(full, alignMatrix, bilinearPaint);
 
-            // MobileFaceNet giriş normalizasyonu: (kanal - 128) / 128 (RGB)
             faceInputBitmap.getPixels(facePixels, 0, FACE_INPUT_SIZE, 0, 0, FACE_INPUT_SIZE, FACE_INPUT_SIZE);
             faceInputBuffer.rewind();
             for (int i = 0; i < facePixels.length; i++) {
@@ -380,6 +296,7 @@ public class NeuralIdentityEngine {
             if (normFace != null) {
                 out.faceEmbedding = normFace;
                 out.faceScore = bestScore;
+                out.isFrontal = frontal;
             }
         } catch (Throwable t) {
             Log.w(TAG, "Face embedding hatası: " + t.getMessage());
@@ -399,9 +316,6 @@ public class NeuralIdentityEngine {
         return out;
     }
 
-    /**
-     * L2-normalize edilmiş iki vektör arasındaki kosinüs benzerliği ([-1..1]).
-     */
     public static float cosineSim(float[] a, float[] b) {
         if (a == null || b == null || a.length != b.length || a.length == 0) return 0f;
         float dot = 0f;
@@ -420,11 +334,8 @@ public class NeuralIdentityEngine {
 
     public void close() {
         closed = true;
-        synchronized (neuralLock) {
-            try { if (bodyEmbedder != null) bodyEmbedder.close(); } catch (Exception ignored) {}
-            bodyEmbedder = null;
+        synchronized (faceLock) {
             closeQuietlyFace();
-            if (!bodyCropBitmap.isRecycled()) bodyCropBitmap.recycle();
             if (!headCropBitmap.isRecycled()) headCropBitmap.recycle();
             if (!faceInputBitmap.isRecycled()) faceInputBitmap.recycle();
         }

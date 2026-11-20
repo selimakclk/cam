@@ -420,21 +420,20 @@ public class PersonDetectorInstrumentedTest {
 
         try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
             assertTrue("SSD motoru baslatilamadi", engine.isInitialized());
-            assertTrue("MobileNetV3 Derin Re-ID hazir olmali", engine.isDeepReIdReady());
-            assertTrue("BlazeFace + MobileFaceNet yuz AI hazir olmali", engine.isFaceAiReady());
+            assertTrue("BlazeFace + MobileFaceNet asenkron yuz AI hazir olmali", engine.isFaceAiReady());
 
             Bitmap roomBmp = BitmapFactory.decodeStream(is);
             assertNotNull(roomBmp);
 
             PersonDetectorEngine.AnalysisOutput out = engine.processFrame(roomBmp);
             assertFalse("Odada kisi algilanmali", out.persons.isEmpty());
-            TrackedPerson p = out.persons.get(0);
-            assertTrue("Derin vucut AI gommesi cikarilmali", p.hasDeepAi);
-            assertNotNull("Derin vucut vektoru bos olmamali", p.deepBodyEmbedding);
-            assertTrue("Derin vucut vektor boyutu >= 128 olmali", p.deepBodyEmbedding.length >= 128);
-            assertTrue("Biyometrik yuz AI gommesi cikarilmali", p.hasFaceAi);
-            assertNotNull("Yuz vektoru bos olmamali", p.faceEmbedding);
-            assertTrue("Yuz vektor boyutu >= 128 olmali", p.faceEmbedding.length >= 128);
+            assertNotNull("129-D Re-ID imzasi cikarilmali", out.persons.get(0).signature);
+
+            // Asenkron yuz AI'nin arka planda isi bitirmesini bekle ve ogrendigini dogrula
+            engine.waitForPendingFaceWork(2500);
+            PersonDetectorEngine.AnalysisOutput out2 = engine.processFrame(roomBmp);
+            assertFalse(out2.persons.isEmpty());
+            assertTrue("Asenkron biyometrik yuz AI ogrenilmis olmali", out2.persons.get(0).hasFaceAi);
         } finally {
             engine.close();
             if (memFile.exists()) memFile.delete();
@@ -492,9 +491,11 @@ public class PersonDetectorInstrumentedTest {
             Bitmap roomBmp = BitmapFactory.decodeStream(is);
             assertNotNull(roomBmp);
 
-            // 1. Kisi tespit edilir, yuz+vucut ogrenilir, isim verilir ve kilitlenir
+            // 1. Kisi tespit edilir, arka planda asenkron yuz ogrenilir, isim verilir ve kilitlenir
             PersonDetectorEngine.AnalysisOutput out1 = engine.processFrame(roomBmp);
             assertFalse(out1.persons.isEmpty());
+            engine.waitForPendingFaceWork(2500);
+            out1 = engine.processFrame(roomBmp);
             TrackedPerson person = out1.persons.get(0);
             assertTrue("Test gorselinde yuz ogrenilmis olmali", person.hasFaceAi);
             engine.renamePerson(person.id, "Ev Sahibi");
@@ -531,12 +532,15 @@ public class PersonDetectorInstrumentedTest {
             yellowPants.setColor(Color.argb(215, 235, 200, 30));
             c.drawRect(torsoLeft, torsoMid, torsoRight, legsBot, yellowPants);
 
+            // Asenkron arka plan yuz motorunun kiyafet degisimini yakalamasina izin ver
+            Thread.sleep(360);
             PersonDetectorEngine.AnalysisOutput rec = engine.processFrame(newOutfit);
+            engine.waitForPendingFaceWork(2500);
             if (rec.locked != null && rec.locked.lost) {
                 rec = engine.processFrame(newOutfit);
             }
             assertNotNull(rec.locked);
-            assertFalse("Kiyafet degisse bile biyometrik yuz AI ile geri taninmali!", rec.locked.lost);
+            assertFalse("Kiyafet degisse bile asenkron biyometrik yuz AI ile geri taninmali!", rec.locked.lost);
             assertEquals("Kiyafet degisimi sonrasi ayni ID korunmali", lockedId, rec.locked.id);
             assertEquals("Kiyafet degisimi sonrasi isim korunmali", "Ev Sahibi", rec.locked.name);
 
