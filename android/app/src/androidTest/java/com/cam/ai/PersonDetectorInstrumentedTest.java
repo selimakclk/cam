@@ -594,4 +594,52 @@ public class PersonDetectorInstrumentedTest {
             server.stop();
         }
     }
+
+    @Test
+    public void testCameraMonitorServiceRunsDetachedForScreenOff() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        // Android 14+ camera FGS testi icin CAMERA iznini test surecine ver
+        InstrumentationRegistry.getInstrumentation().getUiAutomation()
+                .grantRuntimePermission(ctx.getPackageName(), android.Manifest.permission.CAMERA);
+
+        // On plan aktivite baglamindan servisi baslat (Android 14/15/16/17 FGS kurali)
+        android.content.Intent actIntent = new android.content.Intent(ctx, MainActivity.class);
+        actIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+        android.app.Activity act = InstrumentationRegistry.getInstrumentation().startActivitySync(actIntent);
+        try {
+            CameraMonitorService.startService(act, "77889");
+            long deadline = System.currentTimeMillis() + 5000;
+            while (!CameraMonitorService.isRunning() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(100);
+            }
+            CameraMonitorService svc = CameraMonitorService.getInstance();
+            assertNotNull("CameraMonitorService baslatilmis olmali", svc);
+            assertTrue("Servis aktif olmali", CameraMonitorService.isRunning());
+            assertEquals("Servis RESUMED yasam dongusunde olmali",
+                    androidx.lifecycle.Lifecycle.State.RESUMED, svc.getLifecycle().getCurrentState());
+            assertTrue("Ekran kapaliyken CPU WakeLock aktif olmali", svc.isWakeLockHeld());
+            assertTrue("Ekran kapaliyken Wi-Fi Lock aktif olmali", svc.isWifiLockHeld());
+
+            // Ekran kapatma / telefon kilitleme simulasyonu: UI tamamen ayrilir (detachUi)
+            svc.detachUi();
+            Thread.sleep(600);
+
+            // UI ayrildiktan sonra da servis RESUMED kalmali ve HTTP sunucusu canli yanit vermeli!
+            assertTrue("Ekran kapaliyken servis hala calisiyor olmali", CameraMonitorService.isRunning());
+            assertEquals("UI ayrilinca servis yasam dongusu dusmemeli",
+                    androidx.lifecycle.Lifecycle.State.RESUMED, svc.getLifecycle().getCurrentState());
+            String pingResp = httpGet("http://127.0.0.1:8080/ping?code=77889");
+            assertTrue("Ekran kapaliyken /ping yanit vermeli", pingResp.contains("\"ok\":true"));
+            String stateResp = httpGet("http://127.0.0.1:8080/state?code=77889");
+            assertTrue("Ekran kapaliyken /state AI durumu donmeli", stateResp.contains("\"persons\""));
+        } finally {
+            CameraMonitorService.stopService(ctx);
+            long stopDeadline = System.currentTimeMillis() + 4000;
+            while (CameraMonitorService.isRunning() && System.currentTimeMillis() < stopDeadline) {
+                Thread.sleep(100);
+            }
+            if (act != null) act.finish();
+        }
+        assertFalse("Durdurulunca servis temiz kapanmali", CameraMonitorService.isRunning());
+    }
 }

@@ -1,18 +1,18 @@
 package com.cam.ai;
 
 import android.Manifest;
-import android.annotation.SuppressLint;
+import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.graphics.Matrix;
-import android.graphics.Paint;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.text.InputType;
-import android.util.Size;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
@@ -28,31 +28,17 @@ import androidx.activity.OnBackPressedCallback;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.camera.core.Camera;
-import androidx.camera.core.CameraSelector;
-import androidx.camera.core.ImageAnalysis;
-import androidx.camera.core.ImageProxy;
-import androidx.camera.core.Preview;
-import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
-import com.google.common.util.concurrent.ListenableFuture;
-import java.io.ByteArrayOutputStream;
-import java.nio.ByteBuffer;
-import java.util.Collections;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class MainActivity extends AppCompatActivity {
 
     private static final int PERMISSION_REQ_CODE = 1001;
     private static final String STEALTH_PIN = "7693";
-    private static final int STREAM_PORT = 8080;
 
     // Ana Konteynerler
     private FrameLayout cameraContainer;
@@ -87,18 +73,7 @@ public class MainActivity extends AppCompatActivity {
     private EditText editPassword;
     private TextView txtPinDots;
 
-    // Servisler ve Motorlar
-    private ProcessCameraProvider cameraProvider;
-    private Camera activeCamera;
-    private CameraSelector cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA;
-    private boolean isFrontCamera = false;
-    private boolean isTorchOn = false;
-
-    private ExecutorService cameraExecutor;
-    private ExecutorService aiExecutor;
-    private volatile PersonDetectorEngine personEngine;
-    private SirenAudioEngine sirenEngine;
-    private CameraStreamServer streamServer;
+    // Servisler
     private ViewerStreamClient viewerClient;
     private GitHubUpdater githubUpdater;
     private Button btnCheckUpdate;
@@ -106,21 +81,12 @@ public class MainActivity extends AppCompatActivity {
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private String roomCode = "12345";
     private boolean pendingStartCameraAfterPerm = false;
+    private boolean batteryPromptShownThisSession = false;
     private boolean isAlarmShowing = false;
     private boolean isStealthActive = false;
-    private StringBuilder pinInput = new StringBuilder();
+    private final StringBuilder pinInput = new StringBuilder();
 
-    // Performans / Stream sayaçları & çift-thread sıfır-GC tamponları
-    private static final int MAX_AI_SIDE = 512;
-    private int frameCounter = 0;
-    private long lastFpsCalcTs = System.currentTimeMillis();
     private long lastFpsTextTs = 0L;
-    private int framesInSecond = 0;
-    private int lastFps = 0;
-    private volatile int lastInferTimeMs = 0;
-    private volatile boolean isAnalyzing = false;
-    private final AtomicBoolean aiBusy = new AtomicBoolean(false);
-    private volatile List<TrackedPerson> latestAiPersons = Collections.emptyList();
     private final AtomicReference<Bitmap> pendingViewerFrame = new AtomicReference<>();
     private final Runnable applyViewerFrameRunnable = () -> {
         if (isFinishing() || isDestroyed() || viewerContainer.getVisibility() != View.VISIBLE) return;
@@ -132,7 +98,7 @@ public class MainActivity extends AppCompatActivity {
     private final Runnable refreshIpRunnable = new Runnable() {
         @Override
         public void run() {
-            if (isFinishing() || isDestroyed() || cameraContainer.getVisibility() != View.VISIBLE || streamServer == null) {
+            if (isFinishing() || isDestroyed() || cameraContainer.getVisibility() != View.VISIBLE) {
                 return;
             }
             List<String> ips = CameraStreamServer.getAllLocalIpv4Addresses();
@@ -142,24 +108,89 @@ public class MainActivity extends AppCompatActivity {
         }
     };
 
-    private Bitmap cachedRawBitmap = null;
-    private Bitmap cachedUprightBitmap = null;
-    private Canvas cachedUprightCanvas = null;
-    private Bitmap aiWorkBitmap = null;
-    private Canvas aiWorkCanvas = null;
-    private final Matrix uprightMatrix = new Matrix();
-    private final Paint uprightPaint = new Paint();
-    private final ByteArrayOutputStream reusableJpegOut = new ByteArrayOutputStream(24576);
     private String lastStatusText = "";
     private String lastTargetText = "";
     private int lastUnlockVisibility = View.GONE;
     private String lastViewerTargetText = "";
     private int lastViewerUnlockVisibility = View.GONE;
 
+    private final CameraMonitorService.UiCallback cameraUiCallback = new CameraMonitorService.UiCallback() {
+        @Override
+        public void onSourceInfo(int w, int h, boolean isFront) {
+            if (isFinishing() || isDestroyed()) return;
+            overlayView.setSourceInfo(w, h, isFront);
+        }
+
+        @Override
+        public void onFastFrame(List<TrackedPerson> persons, PersonDetectorEngine.LockedState locked, int fps, int inferMs) {
+            if (isFinishing() || isDestroyed() || cameraContainer.getVisibility() != View.VISIBLE) return;
+            overlayView.updateState(persons, locked);
+            long uiNow = System.currentTimeMillis();
+            if (uiNow - lastFpsTextTs >= 500) {
+                lastFpsTextTs = uiNow;
+                txtFpsDisplay.setText(fps + " FPS • " + inferMs + "ms");
+            }
+        }
+
+        @Override
+        public void onAiOutput(PersonDetectorEngine.AnalysisOutput result) {
+            if (isFinishing() || isDestroyed() || cameraContainer.getVisibility() != View.VISIBLE) return;
+            overlayView.updateState(result.persons, result.locked);
+            updateCameraHud(result);
+        }
+
+        @Override
+        public void onTapLockResult(PersonDetectorEngine.LockedState snap, boolean locked, float sx, float sy) {
+            if (isFinishing() || isDestroyed()) return;
+            if (locked) {
+                dismissAlarmVisualOnly();
+                overlayView.triggerFocusRing(sx, sy, false);
+                updateTargetHud(snap);
+            } else {
+                overlayView.triggerFocusRing(sx, sy, true);
+                showWarningBanner("Kişi seçilmedi — Bir insana dokunun");
+            }
+        }
+
+        @Override
+        public void onRemoteLockApplied(PersonDetectorEngine.LockedState snap) {
+            if (isFinishing() || isDestroyed()) return;
+            dismissAlarmVisualOnly();
+            updateTargetHud(snap);
+        }
+
+        @Override
+        public void onAlarmStateChanged(boolean alarmShowing) {
+            if (isFinishing() || isDestroyed()) return;
+            if (alarmShowing) triggerAlarmVisualOnly();
+            else dismissAlarmVisualOnly();
+        }
+
+        @Override
+        public void onTorchChanged(boolean torchOn) {
+            if (isFinishing() || isDestroyed()) return;
+            btnTorch.setText(torchOn ? "Flaş: Açık" : "Flaş");
+            btnTorch.setTextColor(torchOn ? 0xFFFFD60A : 0xFFFFFFFF);
+        }
+
+        @Override
+        public void onEngineError(String error) {
+            if (isFinishing() || isDestroyed()) return;
+            Toast.makeText(MainActivity.this, "AI Model Hatası: " + error, Toast.LENGTH_LONG).show();
+        }
+
+        @Override
+        public void onServiceStopped() {
+            if (isFinishing() || isDestroyed()) return;
+            if (cameraContainer.getVisibility() == View.VISIBLE) {
+                showRoleScreenClean();
+            }
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         setContentView(R.layout.activity_main);
 
         bindViews();
@@ -168,11 +199,37 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        // Ekran kilitlenip tekrar açıldıysa ve servis arka planda çalışıyorsa canlı kamera UI'ını anında geri bağla!
+        if (CameraMonitorService.isRunning()) {
+            CameraMonitorService svc = CameraMonitorService.getInstance();
+            if (svc != null) {
+                roomCode = svc.getRoomCode();
+                enterCameraUiShell();
+                svc.attachUi(previewView.getSurfaceProvider(), cameraUiCallback);
+            }
+        }
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         if (githubUpdater != null) {
             githubUpdater.onActivityResumed(this);
         }
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        // KRİTİK: Ekran kapandığında / güç tuşuna basıldığında servisi ASLA durdurma; yalnızca önizleme yüzeyini ayır!
+        CameraMonitorService.setServiceReadyListener(null);
+        CameraMonitorService svc = CameraMonitorService.getInstance();
+        if (svc != null && CameraMonitorService.isRunning()) {
+            svc.detachUi();
+        }
+        uiHandler.removeCallbacks(refreshIpRunnable);
     }
 
     private void bindViews() {
@@ -219,13 +276,27 @@ public class MainActivity extends AppCompatActivity {
         // Kamera İçi Kontroller
         findViewById(R.id.btnStealth).setOnClickListener(v -> enterStealthMode());
         btnMemory.setOnClickListener(v -> showMemoryManagerDialog());
-        btnTorch.setOnClickListener(v -> toggleTorch());
-        findViewById(R.id.btnFlip).setOnClickListener(v -> flipCamera());
+        btnTorch.setOnClickListener(v -> {
+            CameraMonitorService svc = CameraMonitorService.getInstance();
+            if (svc == null || !svc.toggleTorch()) {
+                Toast.makeText(this, "Bu kamerada flaş desteklenmiyor", Toast.LENGTH_SHORT).show();
+            }
+        });
+        findViewById(R.id.btnFlip).setOnClickListener(v -> {
+            CameraMonitorService svc = CameraMonitorService.getInstance();
+            if (svc != null) svc.flipCamera();
+        });
         findViewById(R.id.btnBackMain).setOnClickListener(v -> returnToMain());
-        btnUnlock.setOnClickListener(v -> unlockTarget());
+        btnUnlock.setOnClickListener(v -> {
+            CameraMonitorService svc = CameraMonitorService.getInstance();
+            if (svc != null) svc.unlockTarget();
+            updateTargetHud(null);
+            dismissAlarmVisualOnly();
+        });
         btnNameTarget.setOnClickListener(v -> {
-            if (personEngine == null) return;
-            PersonDetectorEngine.LockedState locked = personEngine.getLockedStateSnapshot();
+            PersonDetectorEngine eng = getActiveEngine();
+            if (eng == null) return;
+            PersonDetectorEngine.LockedState locked = eng.getLockedStateSnapshot();
             if (locked != null) {
                 promptRenamePersonDialog(locked.id, locked.name);
             }
@@ -233,7 +304,11 @@ public class MainActivity extends AppCompatActivity {
 
         // Alarm Kapatma
         findViewById(R.id.btnDismissAlarm).setOnClickListener(v -> {
-            dismissAlarm();
+            dismissAlarmVisualOnly();
+            CameraMonitorService svc = CameraMonitorService.getInstance();
+            if (svc != null && cameraContainer.getVisibility() == View.VISIBLE) {
+                svc.dismissAlarm();
+            }
             if (viewerContainer.getVisibility() == View.VISIBLE && viewerClient != null) {
                 viewerClient.sendAction("dismiss_alarm");
             }
@@ -255,22 +330,12 @@ public class MainActivity extends AppCompatActivity {
             if (viewerClient != null) viewerClient.sendAction("flip");
         });
 
-        // Kamera Ekranında Kişiye Dokunma -> Önce anlık önbellekten (<1ms), gerekirse AI Zoom ile kilitle
+        // Kamera Ekranında Kişiye Dokunma -> Servise ilet
         overlayView.setOnTapNormListener((nx, ny, sx, sy) -> {
-            if (personEngine == null) return;
-            cameraExecutor.execute(() -> {
-                PersonDetectorEngine.LockedState lockedSnapshot = new PersonDetectorEngine.LockedState();
-                PersonDetectorEngine.LockStatus fastRes = personEngine.tryLockFast(nx, ny, lockedSnapshot);
-                if (fastRes == PersonDetectorEngine.LockStatus.LOCKED) {
-                    applyTapLockResult(lockedSnapshot, true, sx, sy);
-                } else {
-                    aiExecutor.execute(() -> {
-                        PersonDetectorEngine.LockedState zoomSnap = new PersonDetectorEngine.LockedState();
-                        PersonDetectorEngine.LockStatus zoomRes = personEngine.tryLockAt(nx, ny, zoomSnap);
-                        applyTapLockResult(zoomSnap, zoomRes == PersonDetectorEngine.LockStatus.LOCKED, sx, sy);
-                    });
-                }
-            });
+            CameraMonitorService svc = CameraMonitorService.getInstance();
+            if (svc != null) {
+                svc.tapLockAt(nx, ny, sx, sy);
+            }
         });
 
         // İzleyici Ekranında Kişiye Dokunma -> Kameraya Kilitleme Komutu Gönder
@@ -281,39 +346,18 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private void applyTapLockResult(PersonDetectorEngine.LockedState snap, boolean locked, float sx, float sy) {
-        runOnUiThread(() -> {
-            if (locked) {
-                sirenEngine.playLockBeep();
-                dismissAlarm();
-                overlayView.triggerFocusRing(sx, sy, false);
-                updateTargetHud(snap);
-            } else {
-                sirenEngine.playErrorBeep();
-                overlayView.triggerFocusRing(sx, sy, true);
-                showWarningBanner("Kişi seçilmedi — Bir insana dokunun");
-            }
-        });
+    private PersonDetectorEngine getActiveEngine() {
+        CameraMonitorService svc = CameraMonitorService.getInstance();
+        return (svc != null) ? svc.getPersonEngine() : null;
     }
 
     private void initServices() {
-        cameraExecutor = Executors.newSingleThreadExecutor();
-        aiExecutor = Executors.newSingleThreadExecutor();
-        sirenEngine = new SirenAudioEngine(this);
         viewerClient = new ViewerStreamClient(this, createViewerListener());
         githubUpdater = new GitHubUpdater();
         githubUpdater.checkSilently(this, (hasUpdate, latestVer) -> {
             if (!isFinishing() && !isDestroyed() && btnCheckUpdate != null && hasUpdate) {
                 btnCheckUpdate.setText("Yeni Sürüm Var (v" + latestVer + ") • Güncelle!");
                 btnCheckUpdate.setTextColor(0xFF30D158);
-            }
-        });
-        aiExecutor.execute(() -> {
-            PersonDetectorEngine engine = new PersonDetectorEngine(MainActivity.this);
-            personEngine = engine;
-            if (!engine.isInitialized()) {
-                runOnUiThread(() -> Toast.makeText(MainActivity.this,
-                        "AI Model Hatası: " + engine.getInitError(), Toast.LENGTH_LONG).show());
             }
         });
     }
@@ -347,9 +391,14 @@ public class MainActivity extends AppCompatActivity {
 
         if (!hasCameraPermission()) {
             pendingStartCameraAfterPerm = true;
-            ActivityCompat.requestPermissions(this,
-                    new String[]{Manifest.permission.CAMERA},
-                    PERMISSION_REQ_CODE);
+            List<String> perms = new ArrayList<>();
+            perms.add(Manifest.permission.CAMERA);
+            if (Build.VERSION.SDK_INT >= 33
+                    && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.POST_NOTIFICATIONS);
+            }
+            ActivityCompat.requestPermissions(this, perms.toArray(new String[0]), PERMISSION_REQ_CODE);
             return;
         }
         startCameraMode();
@@ -373,17 +422,53 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void startCameraMode() {
+    private void enterCameraUiShell() {
         roleContainer.setVisibility(View.GONE);
         viewerContainer.setVisibility(View.GONE);
         cameraContainer.setVisibility(View.VISIBLE);
 
         txtIpBadge.setText("Şifre: " + roomCode);
-        txtStatus.setText("Kamera Başlatılıyor...");
-        unlockTarget();
+        if (lastStatusText.isEmpty()) {
+            txtStatus.setText("Kamera Başlatılıyor...");
+        }
+        uiHandler.removeCallbacks(refreshIpRunnable);
+        uiHandler.post(refreshIpRunnable);
+    }
 
-        startLocalStreamServer();
-        startCameraX();
+    private void startCameraMode() {
+        enterCameraUiShell();
+        updateTargetHud(null);
+        dismissAlarmVisualOnly();
+
+        CameraMonitorService.setServiceReadyListener(svc -> {
+            if (isFinishing() || isDestroyed() || cameraContainer.getVisibility() != View.VISIBLE) return;
+            svc.attachUi(previewView.getSurfaceProvider(), cameraUiCallback);
+        });
+        CameraMonitorService.startService(this, roomCode);
+
+        maybeOfferBatteryOptimizationWhitelist();
+    }
+
+    private void maybeOfferBatteryOptimizationWhitelist() {
+        if (batteryPromptShownThisSession || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                batteryPromptShownThisSession = true;
+                new AlertDialog.Builder(this)
+                        .setTitle("Ekran Kapalıyken Kesintisiz Çalışma")
+                        .setMessage("Telefon kilitlendiğinde sistemin kamerayı uyutmaması için pil kısıtlamasını kaldırmanız önerilir.")
+                        .setPositiveButton("İzin Ver", (d, w) -> {
+                            try {
+                                Intent i = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                                i.setData(Uri.parse("package:" + getPackageName()));
+                                startActivity(i);
+                            } catch (Exception ignored) {}
+                        })
+                        .setNegativeButton("Şimdi Değil", null)
+                        .show();
+            }
+        } catch (Exception ignored) {}
     }
 
     private void onViewerRoleClicked() {
@@ -405,203 +490,22 @@ public class MainActivity extends AppCompatActivity {
         viewerClient.startAutoConnect(roomCode);
     }
 
-    // =================== CAMERAX + TFLITE AI İŞLEME ===================
-    private void startCameraX() {
-        ListenableFuture<ProcessCameraProvider> future = ProcessCameraProvider.getInstance(this);
-        future.addListener(() -> {
-            try {
-                cameraProvider = future.get();
-                bindCameraUseCases();
-            } catch (Exception e) {
-                Toast.makeText(this, "Kamera hatası: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-            }
-        }, ContextCompat.getMainExecutor(this));
-    }
-
-    private void bindCameraUseCases() {
-        if (cameraProvider == null) return;
-        cameraProvider.unbindAll();
-        isTorchOn = false;
-        updateTorchUi();
-
-        Preview preview = new Preview.Builder().build();
-        preview.setSurfaceProvider(previewView.getSurfaceProvider());
-
-        ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .setTargetResolution(new Size(480, 640))
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build();
-
-        imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeImageProxy);
-
-        try {
-            activeCamera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis);
-        } catch (Exception e) {
-            Toast.makeText(this, "Kamera bağlanamadı: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private void analyzeImageProxy(@NonNull ImageProxy imageProxy) {
-        if (isAnalyzing || personEngine == null) {
-            imageProxy.close();
-            return;
-        }
-        isAnalyzing = true;
-        Bitmap tempRaw = null;
-        try {
-            int rawW = imageProxy.getWidth();
-            int rawH = imageProxy.getHeight();
-            int rotation = imageProxy.getImageInfo().getRotationDegrees();
-            ImageProxy.PlaneProxy plane = imageProxy.getPlanes()[0];
-            Bitmap rawSrc;
-            if (plane.getPixelStride() == 4 && plane.getRowStride() == rawW * 4) {
-                if (cachedRawBitmap == null || cachedRawBitmap.isRecycled()
-                        || cachedRawBitmap.getWidth() != rawW || cachedRawBitmap.getHeight() != rawH) {
-                    if (cachedRawBitmap != null && !cachedRawBitmap.isRecycled()) cachedRawBitmap.recycle();
-                    cachedRawBitmap = Bitmap.createBitmap(rawW, rawH, Bitmap.Config.ARGB_8888);
-                }
-                ByteBuffer buf = plane.getBuffer();
-                buf.rewind();
-                cachedRawBitmap.copyPixelsFromBuffer(buf);
-                rawSrc = cachedRawBitmap;
-            } else {
-                tempRaw = imageProxy.toBitmap();
-                rawSrc = tempRaw;
-            }
-            imageProxy.close();
-
-            Bitmap upright = drawIntoReusableUpright(rawSrc, rawW, rawH, rotation);
-            if (tempRaw != null && !tempRaw.isRecycled()) {
-                tempRaw.recycle();
-                tempRaw = null;
-            }
-
-            int bw = upright.getWidth();
-            int bh = upright.getHeight();
-            overlayView.setSourceInfo(bw, bh, isFrontCamera);
-
-            // 1. Yalnızca aktif video akışı isteyen izleyici varken JPEG sıkıştır (PC oyun uykusundayken 0 JPEG yükü!)
-            frameCounter++;
-            final boolean hasVideoViewer = (streamServer != null && streamServer.hasActiveVideoStream());
-            if (hasVideoViewer && frameCounter % 2 == 0) {
-                reusableJpegOut.reset();
-                upright.compress(Bitmap.CompressFormat.JPEG, 55, reusableJpegOut);
-                streamServer.updateFrame(reusableJpegOut.toByteArray());
-            }
-
-            // 2. Gerçek canlı kamera & 30 FPS Optik Takip adımı (<3ms, AI'yi ASLA beklemez!)
-            framesInSecond++;
-            long now = System.currentTimeMillis();
-            if (now - lastFpsCalcTs >= 1000) {
-                lastFps = framesInSecond;
-                framesInSecond = 0;
-                lastFpsCalcTs = now;
-            }
-
-            PersonDetectorEngine.LockedState fastLocked = personEngine.fastTrackFrame(upright);
-            final List<TrackedPerson> cachedPersons = latestAiPersons;
-            uiHandler.post(() -> {
-                if (isFinishing() || isDestroyed() || cameraContainer.getVisibility() != View.VISIBLE) return;
-                overlayView.updateState(cachedPersons, fastLocked);
-                long uiNow = System.currentTimeMillis();
-                if (uiNow - lastFpsTextTs >= 500) {
-                    lastFpsTextTs = uiNow;
-                    int shownFps = (lastFps > 0) ? lastFps : framesInSecond;
-                    txtFpsDisplay.setText(shownFps + " FPS • " + lastInferTimeMs + "ms");
-                }
-            });
-
-            // 3. Arka plan AI iş parçacığı boşsa yeni kareyi asenkron teslim et
-            if (personEngine.isInitialized() && aiBusy.compareAndSet(false, true)) {
-                try {
-                    if (aiWorkBitmap == null || aiWorkBitmap.isRecycled()
-                            || aiWorkBitmap.getWidth() != bw || aiWorkBitmap.getHeight() != bh) {
-                        if (aiWorkBitmap != null && !aiWorkBitmap.isRecycled()) aiWorkBitmap.recycle();
-                        aiWorkBitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
-                        aiWorkCanvas = new Canvas(aiWorkBitmap);
-                    }
-                    aiWorkCanvas.drawBitmap(upright, 0f, 0f, null);
-
-                    final int aiW = bw;
-                    final int aiH = bh;
-                    final boolean aiFront = isFrontCamera;
-                    aiExecutor.execute(() -> {
-                        try {
-                            PersonDetectorEngine.AnalysisOutput result = personEngine.processFrame(aiWorkBitmap);
-                            latestAiPersons = (result.persons != null) ? result.persons : Collections.emptyList();
-                            lastInferTimeMs = result.inferTimeMs;
-
-                            if (streamServer != null && streamServer.hasActiveViewer()) {
-                                streamServer.updateAiState(aiW, aiH, aiFront, isAlarmShowing, result.persons, result.locked);
-                            }
-
-                            uiHandler.post(() -> {
-                                if (isFinishing() || isDestroyed() || cameraContainer.getVisibility() != View.VISIBLE) return;
-                                overlayView.updateState(result.persons, result.locked);
-                                updateCameraHud(result);
-                            });
-                        } catch (Exception ignored) {
-                        } finally {
-                            aiBusy.set(false);
-                        }
-                    });
-                } catch (Exception ex) {
-                    aiBusy.set(false);
-                }
-            }
-
-        } catch (Exception e) {
-            try { imageProxy.close(); } catch (Exception ignored) {}
-        } finally {
-            if (tempRaw != null && !tempRaw.isRecycled()) tempRaw.recycle();
-            isAnalyzing = false;
-        }
-    }
-
-    private Bitmap drawIntoReusableUpright(Bitmap src, int rw, int rh, int rotationDegrees) {
-        boolean rotated90or270 = (rotationDegrees == 90 || rotationDegrees == 270);
-        int rotW = rotated90or270 ? rh : rw;
-        int rotH = rotated90or270 ? rw : rh;
-        int maxRotSide = Math.max(rotW, rotH);
-        float scale = (maxRotSide > MAX_AI_SIDE) ? ((float) MAX_AI_SIDE / maxRotSide) : 1f;
-        int uw = Math.max(1, Math.round(rotW * scale));
-        int uh = Math.max(1, Math.round(rotH * scale));
-
-        if (cachedUprightBitmap == null || cachedUprightBitmap.isRecycled()
-                || cachedUprightBitmap.getWidth() != uw || cachedUprightBitmap.getHeight() != uh) {
-            if (personEngine != null) personEngine.clearFrameCache();
-            if (cachedUprightBitmap != null && !cachedUprightBitmap.isRecycled()) {
-                cachedUprightBitmap.recycle();
-            }
-            cachedUprightBitmap = Bitmap.createBitmap(uw, uh, Bitmap.Config.ARGB_8888);
-            cachedUprightCanvas = new Canvas(cachedUprightBitmap);
-        }
-
-        uprightMatrix.reset();
-        uprightMatrix.postTranslate(-rw * 0.5f, -rh * 0.5f);
-        if (rotationDegrees != 0) uprightMatrix.postRotate(rotationDegrees);
-        if (scale != 1f) uprightMatrix.postScale(scale, scale);
-        uprightMatrix.postTranslate(uw * 0.5f, uh * 0.5f);
-
-        cachedUprightCanvas.drawBitmap(src, uprightMatrix, uprightPaint);
-        return cachedUprightBitmap;
-    }
-
+    // =================== HUD & HAFIZA YÖNETİMİ ===================
     private void updateCameraHud(PersonDetectorEngine.AnalysisOutput out) {
         int count = (out.persons != null) ? out.persons.size() : 0;
+        PersonDetectorEngine eng = getActiveEngine();
 
         String newStatus;
-        if (personEngine == null || !personEngine.isInitialized()) {
+        if (eng == null || !eng.isInitialized()) {
             newStatus = "⚠ AI Model Yüklenemedi";
         } else if (out.locked != null) {
             newStatus = out.locked.lost
-                    ? "⚠ HEDEF KAYIP!"
-                    : "Kilitli Takip Aktif (" + count + " Kişi)";
+                    ? "⚠ HEDEF KAYIP! (Arka Plan Aktif)"
+                    : "Kilitli Takip • Ekran Kapalı Çalışır (" + count + " Kişi)";
         } else if (count > 0) {
-            newStatus = "Canlı • " + count + " Kişi Algılandı";
+            newStatus = "Canlı • Ekran Kapalı Çalışır (" + count + " Kişi)";
         } else {
-            newStatus = "Canlı • İnsan Aranıyor...";
+            newStatus = "Canlı • Ekran Kapalı Çalışır • Aranıyor...";
         }
 
         if (!newStatus.equals(lastStatusText)) {
@@ -610,14 +514,15 @@ public class MainActivity extends AppCompatActivity {
         }
 
         if (out.targetJustLost) {
-            triggerAlarm();
+            triggerAlarmVisualOnly();
             if (out.locked != null) updateTargetHud(out.locked);
         } else if (out.targetJustRecovered) {
-            dismissAlarm();
+            dismissAlarmVisualOnly();
             if (out.locked != null) updateTargetHud(out.locked);
         } else if (out.locked != null) {
             updateTargetHud(out.locked);
         }
+
         if (btnMemory != null) {
             String memLabel = (out.rememberedCount > 0) ? ("Hafıza (" + out.rememberedCount + ")") : "Hafıza";
             if (!memLabel.equals(btnMemory.getText().toString())) {
@@ -670,12 +575,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showMemoryManagerDialog() {
-        if (personEngine == null) {
+        PersonDetectorEngine eng = getActiveEngine();
+        if (eng == null) {
             Toast.makeText(this, "Yapay zeka motoru henüz hazırlanıyor", Toast.LENGTH_SHORT).show();
             return;
         }
-        List<PersonMemoryStore.ProfileSummary> profiles = personEngine.getMemorySummaries();
-        String engineLine = "Motor: " + personEngine.getAiEngineSummary();
+        List<PersonMemoryStore.ProfileSummary> profiles = eng.getMemorySummaries();
+        String engineLine = "Motor: " + eng.getAiEngineSummary();
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle("Yapay Zeka Hafıza Bankası (" + profiles.size() + ")");
@@ -686,29 +592,26 @@ public class MainActivity extends AppCompatActivity {
             CharSequence[] items = new CharSequence[profiles.size()];
             for (int i = 0; i < profiles.size(); i++) {
                 PersonMemoryStore.ProfileSummary p = profiles.get(i);
-                StringBuilder line = new StringBuilder(p.displayLabel());
-                line.append("  •  Yüz: ").append(p.faceCount)
-                        .append("  •  Derin AI: ").append(p.deepCount)
-                        .append("  •  İmza: ").append(p.sigCount);
-                items[i] = line.toString();
+                items[i] = p.displayLabel()
+                        + "  •  Yüz: " + p.faceCount
+                        + "  •  Derin AI: " + p.deepCount
+                        + "  •  İmza: " + p.sigCount;
             }
-            builder.setItems(items, (dialog, which) -> {
-                PersonMemoryStore.ProfileSummary chosen = profiles.get(which);
-                showProfileActionDialog(chosen);
-            });
-            builder.setNeutralButton("Tümünü Temizle", (d, w) -> {
-                new AlertDialog.Builder(this)
-                        .setTitle("Hafızayı Temizle")
-                        .setMessage("Kayıtlı tüm kişi isimleri, yüz ve derin yapay zeka vektörleri kalıcı olarak silinsin mi?")
-                        .setPositiveButton("Sil", (d2, w2) -> {
-                            personEngine.clearAllMemory();
+            builder.setItems(items, (dialog, which) -> showProfileActionDialog(profiles.get(which)));
+            builder.setNeutralButton("Tümünü Temizle", (d, w) -> new AlertDialog.Builder(this)
+                    .setTitle("Hafızayı Temizle")
+                    .setMessage("Kayıtlı tüm kişi isimleri, yüz ve derin yapay zeka vektörleri kalıcı olarak silinsin mi?")
+                    .setPositiveButton("Sil", (d2, w2) -> {
+                        PersonDetectorEngine e = getActiveEngine();
+                        if (e != null) {
+                            e.clearAllMemory();
                             btnMemory.setText("Hafıza");
-                            updateTargetHud(personEngine.getLockedStateSnapshot());
-                            Toast.makeText(this, "Kalıcı yapay zeka hafızası sıfırlandı", Toast.LENGTH_SHORT).show();
-                        })
-                        .setNegativeButton("İptal", null)
-                        .show();
-            });
+                            updateTargetHud(e.getLockedStateSnapshot());
+                        }
+                        Toast.makeText(this, "Kalıcı yapay zeka hafızası sıfırlandı", Toast.LENGTH_SHORT).show();
+                    })
+                    .setNegativeButton("İptal", null)
+                    .show());
         }
         builder.setPositiveButton("Kapat", null);
         builder.show();
@@ -721,10 +624,13 @@ public class MainActivity extends AppCompatActivity {
                 .setItems(actions, (d, which) -> {
                     if (which == 0) {
                         promptRenamePersonDialog(profile.id, profile.name);
-                    } else if (which == 1 && personEngine != null) {
-                        personEngine.deletePersonFromMemory(profile.id);
-                        updateTargetHud(personEngine.getLockedStateSnapshot());
-                        Toast.makeText(this, profile.displayLabel() + " hafızadan silindi", Toast.LENGTH_SHORT).show();
+                    } else if (which == 1) {
+                        PersonDetectorEngine e = getActiveEngine();
+                        if (e != null) {
+                            e.deletePersonFromMemory(profile.id);
+                            updateTargetHud(e.getLockedStateSnapshot());
+                            Toast.makeText(this, profile.displayLabel() + " hafızadan silindi", Toast.LENGTH_SHORT).show();
+                        }
                     }
                 })
                 .setNegativeButton("İptal", null)
@@ -732,7 +638,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void promptRenamePersonDialog(int personId, String currentName) {
-        if (personEngine == null) return;
+        PersonDetectorEngine eng = getActiveEngine();
+        if (eng == null) return;
         AlertDialog.Builder b = new AlertDialog.Builder(this);
         b.setTitle("Kişiye İsim Ver (#" + personId + ")");
         b.setMessage("İsim verilen kişiler kalıcı hafızada saklanır; uygulama kapansa veya kıyafet değişse bile yüz/AI ile tanınır.");
@@ -745,11 +652,13 @@ public class MainActivity extends AppCompatActivity {
         }
         b.setView(input);
         b.setPositiveButton("Kaydet", (d, w) -> {
+            PersonDetectorEngine e = getActiveEngine();
+            if (e == null) return;
             String newName = input.getText().toString().trim();
-            personEngine.renamePerson(personId, newName);
-            PersonDetectorEngine.LockedState snap = personEngine.getLockedStateSnapshot();
+            e.renamePerson(personId, newName);
+            PersonDetectorEngine.LockedState snap = e.getLockedStateSnapshot();
             updateTargetHud(snap);
-            overlayView.updateState(personEngine.getLatestPersonsSnapshot(), snap);
+            overlayView.updateState(e.getLatestPersonsSnapshot(), snap);
             Toast.makeText(this, newName.isEmpty() ? "İsim kaldırıldı" : ("Kaydedildi: " + newName), Toast.LENGTH_SHORT).show();
         });
         b.setNegativeButton("İptal", null);
@@ -765,50 +674,18 @@ public class MainActivity extends AppCompatActivity {
 
     private final Runnable hideWarningRunnable = () -> txtWarningBanner.setVisibility(View.GONE);
 
-    private void unlockTarget() {
-        if (personEngine != null) personEngine.unlock();
-        overlayView.updateState(null, null);
-        updateTargetHud(null);
-        dismissAlarm();
-    }
-
-    private void flipCamera() {
-        isFrontCamera = !isFrontCamera;
-        cameraSelector = isFrontCamera ? CameraSelector.DEFAULT_FRONT_CAMERA : CameraSelector.DEFAULT_BACK_CAMERA;
-        unlockTarget();
-        bindCameraUseCases();
-    }
-
-    private void toggleTorch() {
-        if (activeCamera == null || isFrontCamera || !activeCamera.getCameraInfo().hasFlashUnit()) {
-            Toast.makeText(this, "Bu kamerada flaş desteklenmiyor", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        isTorchOn = !isTorchOn;
-        activeCamera.getCameraControl().enableTorch(isTorchOn);
-        updateTorchUi();
-    }
-
-    private void updateTorchUi() {
-        btnTorch.setText(isTorchOn ? "Flaş: Açık" : "Flaş");
-        btnTorch.setTextColor(isTorchOn ? 0xFFFFD60A : 0xFFFFFFFF);
-    }
-
-    // =================== ALARM YÖNETİMİ (TELEFON TAMAMEN SESSİZ) ===================
-    private void triggerAlarm() {
+    // =================== ALARM YÖNETİMİ (TELEFON KESİNLİKLE SESSİZ) ===================
+    private void triggerAlarmVisualOnly() {
         if (isAlarmShowing) return;
         isAlarmShowing = true;
-        // Gizli OLED karartma açıkken ekran siyah kalır; açık ekranda görsel uyarı görünür; SES KESİNLİKLE ÇIKMAZ.
         if (!isStealthActive) {
             alarmOverlay.setVisibility(View.VISIBLE);
         }
-        if (sirenEngine != null) sirenEngine.startAlarm();
     }
 
-    private void dismissAlarm() {
+    private void dismissAlarmVisualOnly() {
         isAlarmShowing = false;
         alarmOverlay.setVisibility(View.GONE);
-        if (sirenEngine != null) sirenEngine.stopAlarm();
     }
 
     // =================== GİZLİ MOD (OLED KARARTMA & PIN TUŞ TAKIMI) ===================
@@ -819,7 +696,6 @@ public class MainActivity extends AppCompatActivity {
         stealthPinPanel.setVisibility(View.GONE);
         stealthScreen.setVisibility(View.VISIBLE);
 
-        // Ekran parlaklığını minimuma çek ve sistem çubuklarını gizle
         WindowManager.LayoutParams lp = getWindow().getAttributes();
         lp.screenBrightness = 0.01f;
         getWindow().setAttributes(lp);
@@ -884,10 +760,8 @@ public class MainActivity extends AppCompatActivity {
 
         if (pinInput.length() == 4) {
             if (STEALTH_PIN.equals(pinInput.toString())) {
-                sirenEngine.playLockBeep();
                 exitStealthMode();
             } else {
-                sirenEngine.playErrorBeep();
                 Toast.makeText(this, "Hatalı PIN!", Toast.LENGTH_SHORT).show();
                 pinInput.setLength(0);
                 updatePinDots();
@@ -932,67 +806,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // =================== YEREL STREAM SUNUCUSU & İZLEYİCİ İLETİŞİMİ ===================
-    private void startLocalStreamServer() {
-        cameraExecutor.execute(() -> {
-            try {
-                if (streamServer != null) streamServer.stop();
-                CameraStreamServer server = new CameraStreamServer(STREAM_PORT, roomCode);
-                server.setOnRemoteCommandListener(new CameraStreamServer.OnRemoteCommandListener() {
-                    @Override
-                    public String onRemoteLock(float nx, float ny) {
-                        if (personEngine == null) return "EMPTY";
-                        PersonDetectorEngine.LockedState snap = new PersonDetectorEngine.LockedState();
-                        PersonDetectorEngine.LockStatus res = personEngine.tryLockFast(nx, ny, snap);
-                        if (res != PersonDetectorEngine.LockStatus.LOCKED && aiExecutor != null) {
-                            try {
-                                res = aiExecutor.submit(() -> personEngine.tryLockAt(nx, ny, snap)).get(600, TimeUnit.MILLISECONDS);
-                            } catch (Exception ignored) {}
-                        }
-                        final PersonDetectorEngine.LockStatus finalRes = res;
-                        runOnUiThread(() -> {
-                            if (finalRes == PersonDetectorEngine.LockStatus.LOCKED) {
-                                sirenEngine.playLockBeep();
-                                dismissAlarm();
-                                updateTargetHud(snap);
-                            }
-                        });
-                        return (finalRes == PersonDetectorEngine.LockStatus.LOCKED) ? "LOCKED" : "EMPTY";
-                    }
-
-                    @Override
-                    public void onRemoteUnlock() {
-                        runOnUiThread(() -> unlockTarget());
-                    }
-
-                    @Override
-                    public void onRemoteDismissAlarm() {
-                        runOnUiThread(() -> dismissAlarm());
-                    }
-
-                    @Override
-                    public void onRemoteFlipCamera() {
-                        runOnUiThread(() -> flipCamera());
-                    }
-
-                    @Override
-                    public void onRemoteToggleTorch() {
-                        runOnUiThread(() -> toggleTorch());
-                    }
-                });
-                server.start();
-                streamServer = server;
-
-                uiHandler.post(() -> {
-                    uiHandler.removeCallbacks(refreshIpRunnable);
-                    uiHandler.post(refreshIpRunnable);
-                });
-            } catch (Exception e) {
-                uiHandler.post(() -> txtCodeDisplay.setText("Oda: " + roomCode + "  •  Yayın Hatası"));
-            }
-        });
-    }
-
+    // =================== TELEFON İZLEYİCİ MODU ===================
     private ViewerStreamClient.Listener createViewerListener() {
         return new ViewerStreamClient.Listener() {
             @Override
@@ -1025,7 +839,6 @@ public class MainActivity extends AppCompatActivity {
                                   List<TrackedPerson> persons, PersonDetectorEngine.LockedState locked) {
                 uiHandler.post(() -> {
                     if (viewerContainer.getVisibility() != View.VISIBLE) return;
-                    // İzleyiciye gelen MJPEG kare düz (aynasız) olduğu için isFront=false kullanılır
                     viewerOverlay.setSourceInfo(w, h, false);
                     viewerOverlay.updateState(persons, locked);
 
@@ -1053,9 +866,9 @@ public class MainActivity extends AppCompatActivity {
                     }
 
                     if (alarm && !isAlarmShowing) {
-                        triggerAlarm();
+                        triggerAlarmVisualOnly();
                     } else if (!alarm && isAlarmShowing) {
-                        dismissAlarm();
+                        dismissAlarmVisualOnly();
                     }
                 });
             }
@@ -1071,10 +884,7 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onRemoteLockResult(boolean locked) {
                 runOnUiThread(() -> {
-                    if (locked) {
-                        sirenEngine.playLockBeep();
-                    } else {
-                        sirenEngine.playErrorBeep();
+                    if (!locked) {
                         Toast.makeText(MainActivity.this, "Kişi seçilmedi — Bir insana dokunun", Toast.LENGTH_SHORT).show();
                     }
                 });
@@ -1100,32 +910,20 @@ public class MainActivity extends AppCompatActivity {
         b.show();
     }
 
-    private void returnToMain() {
+    private void showRoleScreenClean() {
         uiHandler.removeCallbacks(refreshIpRunnable);
         uiHandler.removeCallbacks(applyViewerFrameRunnable);
         pendingViewerFrame.set(null);
         if (isStealthActive) exitStealthMode();
         if (viewerClient != null) viewerClient.stop();
-        if (cameraProvider != null) cameraProvider.unbindAll();
-        activeCamera = null;
-        if (streamServer != null) {
-            streamServer.stop();
-            streamServer = null;
-        }
-        if (personEngine != null) {
-            personEngine.unlock();
-            personEngine.clearFrameCache();
-        }
-        dismissAlarm();
+        dismissAlarmVisualOnly();
+        overlayView.updateState(null, null);
+
         lastStatusText = "";
         lastTargetText = "";
         lastUnlockVisibility = View.GONE;
         lastViewerTargetText = "";
         lastViewerUnlockVisibility = View.GONE;
-        latestAiPersons = Collections.emptyList();
-        lastInferTimeMs = 0;
-        lastFps = 0;
-        framesInSecond = 0;
         lastFpsTextTs = 0L;
 
         cameraContainer.setVisibility(View.GONE);
@@ -1134,23 +932,24 @@ public class MainActivity extends AppCompatActivity {
         roleContainer.setVisibility(View.VISIBLE);
     }
 
+    private void returnToMain() {
+        CameraMonitorService.setServiceReadyListener(null);
+        if (CameraMonitorService.isRunning()) {
+            CameraMonitorService.stopService(this);
+        }
+        showRoleScreenClean();
+    }
+
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        returnToMain();
-        if (cameraExecutor != null) {
-            cameraExecutor.shutdownNow();
-            try { cameraExecutor.awaitTermination(250, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
-        }
-        if (aiExecutor != null) {
-            aiExecutor.shutdownNow();
-            try { aiExecutor.awaitTermination(350, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+        uiHandler.removeCallbacksAndMessages(null);
+        CameraMonitorService.setServiceReadyListener(null);
+        CameraMonitorService svc = CameraMonitorService.getInstance();
+        if (svc != null && CameraMonitorService.isRunning()) {
+            // Ekran kapalı/arka planda çalışırken Activity öldürülse bile servisi KAPATMA!
+            svc.detachUi();
         }
         if (viewerClient != null) viewerClient.release();
-        if (personEngine != null) personEngine.close();
-        if (sirenEngine != null) sirenEngine.release();
-        cachedRawBitmap = null;
-        cachedUprightBitmap = null;
-        aiWorkBitmap = null;
     }
 }
