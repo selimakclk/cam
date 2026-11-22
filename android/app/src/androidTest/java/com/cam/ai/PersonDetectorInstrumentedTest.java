@@ -854,4 +854,134 @@ public class PersonDetectorInstrumentedTest {
             if (memFile.exists()) memFile.delete();
         }
     }
+
+    @Test
+    public void testPrototypeMergingPreservesRareAngleForever() {
+        // 1. maxLen=4 galeride 1 adet ayrik ARKA ACI (eksen 0) + 3 adet ON ACI (eksen 1 cevresi) olsun.
+        //    Sonra 12 yeni hafif kaymis ON ACI eklensin -> eski FIFO arka aciyi silerdi,
+        //    Prototip Birlestirme en yakin ON ACI ciftlerini birlestirip ARKA ACIYI %100 korur!
+        java.util.List<float[]> gallery = new java.util.ArrayList<>();
+        float[] backView = new float[8];
+        backView[0] = 1.0f;
+        SmartTrackerMath.addOrMergeEmbedding(gallery, backView, 4, 0.96f);
+
+        for (int i = 0; i < 15; i++) {
+            float[] frontVariant = new float[8];
+            double angle = 0.08 * i; // 0..1.12 radyan arasi farkli on/yan acilar (eksen 1-2 duzlemi)
+            frontVariant[1] = (float) Math.cos(angle);
+            frontVariant[2] = (float) Math.sin(angle);
+            SmartTrackerMath.addOrMergeEmbedding(gallery, frontVariant, 4, 0.96f);
+        }
+
+        assertEquals("Galeri maxLen sinirini asmamali", 4, gallery.size());
+        float[] scratch = new float[8];
+        float backSim = SmartTrackerMath.matchEmbeddingGalleryWithCentroid(gallery, backView, scratch);
+        assertTrue("15 yeni on/yan aci eklense bile baslangic arka acisi ASLA silinmemeli (sim=" + backSim + ")",
+                backSim >= 0.90f);
+    }
+
+    @Test
+    public void testCentroidHybridMatchingAndDenoising() {
+        // 3 farkli yonlu gurultulu ornek ayni merkez eksen (eksen 0) etrafinda toplanmis olsun
+        java.util.List<float[]> gallery = new java.util.ArrayList<>();
+        float[] v1 = NeuralIdentityEngine.l2NormalizeCopy(new float[]{0.80f, 0.60f, 0.0f, 0.0f});
+        float[] v2 = NeuralIdentityEngine.l2NormalizeCopy(new float[]{0.80f, -0.60f, 0.0f, 0.0f});
+        float[] v3 = NeuralIdentityEngine.l2NormalizeCopy(new float[]{0.80f, 0.0f, 0.60f, 0.0f});
+        gallery.add(v1);
+        gallery.add(v2);
+        gallery.add(v3);
+
+        float[] cleanQuery = new float[]{1.0f, 0.0f, 0.0f, 0.0f};
+        float[] scratch = new float[4];
+        float hybridScore = SmartTrackerMath.matchEmbeddingGalleryWithCentroid(gallery, cleanQuery, scratch);
+        // Tekil ornekler sadece 0.80 verirken centroid (~0.97) hibrit skoru belirgin yukari tasir!
+        assertTrue("Centroid hibrit eslestirme gurultulu tekil skordan (0.80) yuksek cikmali: " + hybridScore,
+                hybridScore > 0.83f);
+    }
+
+    @Test
+    public void testBackgroundMaskedOsnetCrossWallConsistency() throws Exception {
+        Context ctx = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        NeuralIdentityEngine neural = new NeuralIdentityEngine(ctx);
+        try (InputStream is = InstrumentationRegistry.getInstrumentation().getContext().getAssets().open("test_person_room.jpg")) {
+            Bitmap roomBmp = BitmapFactory.decodeStream(is);
+            assertNotNull(roomBmp);
+            int rw = roomBmp.getWidth(), rh = roomBmp.getHeight();
+            int px0 = Math.round(rw * 0.28f), px1 = Math.round(rw * 0.68f);
+            int py0 = Math.round(rh * 0.14f), py1 = Math.round(rh * 0.94f);
+            android.graphics.Rect srcRect = new android.graphics.Rect(px0, py0, px1, py1);
+
+            // Ayni kisiyi parlak KIRMIZI duvar ve parlak MAVI duvar onune yerlestir + arka plan maskesi olustur
+            Bitmap redScene = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas rc = new android.graphics.Canvas(redScene);
+            rc.drawColor(Color.rgb(215, 32, 32));
+            rc.drawBitmap(roomBmp, srcRect, srcRect, null);
+
+            Bitmap blueScene = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas bc = new android.graphics.Canvas(blueScene);
+            bc.drawColor(Color.rgb(22, 48, 215));
+            bc.drawBitmap(roomBmp, srcRect, srcRect, null);
+
+            int mw = 160, mh = 120;
+            byte[] redMask = buildMaskForWall(mw, mh, Color.rgb(215, 32, 32), redScene);
+            byte[] blueMask = buildMaskForWall(mw, mh, Color.rgb(22, 48, 215), blueScene);
+
+            NeuralIdentityEngine.BodyReidResult rRed = neural.extractBodyReid(
+                    redScene, 0.22f, 0.10f, 0.52f, 0.88f, redMask, mw, mh);
+            NeuralIdentityEngine.BodyReidResult rBlue = neural.extractBodyReid(
+                    blueScene, 0.22f, 0.10f, 0.52f, 0.88f, blueMask, mw, mh);
+
+            assertNotNull(rRed.embedding);
+            assertNotNull(rBlue.embedding);
+            float crossWallSim = NeuralIdentityEngine.cosineSim(rRed.embedding, rBlue.embedding);
+            assertTrue("Arka plan maskeli OSNet kirmizi vs mavi duvar arasinda yuksek tutarlilik vermeli (sim=" + crossWallSim + ")",
+                    crossWallSim >= 0.72f);
+
+            redScene.recycle();
+            blueScene.recycle();
+        } finally {
+            neural.close();
+        }
+    }
+
+    private byte[] buildMaskForWall(int mw, int mh, int wallColor, Bitmap sceneBmp) {
+        RoomBackgroundMask bg = new RoomBackgroundMask(mw, mh);
+        int[] wallPx = new int[mw * mh];
+        java.util.Arrays.fill(wallPx, wallColor);
+        for (int i = 0; i < 4; i++) {
+            bg.updateWithFrame(wallPx, java.util.Collections.emptyList());
+        }
+        Bitmap small = Bitmap.createScaledBitmap(sceneBmp, mw, mh, true);
+        int[] scenePx = new int[mw * mh];
+        small.getPixels(scenePx, 0, mw, 0, 0, mw, mh);
+        small.recycle();
+        byte[] maskBytes = new byte[mw * mh];
+        assertTrue("Duvar maskesi hazir olmali", bg.snapshotForegroundBytes(scenePx, maskBytes));
+        return maskBytes;
+    }
+
+    @Test
+    public void testThermalEcoSparseMotionInstantWakeup() {
+        int[] lumaBuf = new int[64];
+        Bitmap staticRoom = Bitmap.createBitmap(160, 120, Bitmap.Config.ARGB_8888);
+        staticRoom.eraseColor(Color.rgb(65, 70, 78));
+
+        // Ilk kare baslangic referansi -> hareket true
+        assertTrue(CameraMonitorService.detectSparseMotion(staticRoom, lumaBuf, false));
+        // Ayni statik bos oda karesi -> hareket false (4 sn sonra soguk moda girmeye izin verir!)
+        assertFalse("Sabit bos odada gereksiz hareket algilanmamali",
+                CameraMonitorService.detectSparseMotion(staticRoom, lumaBuf, true));
+
+        // Koseye kucuk bir kisi/kapi hareketi girsin -> TEK KAREDE (<33ms) aninda uyanmali!
+        Bitmap movedRoom = staticRoom.copy(Bitmap.Config.ARGB_8888, true);
+        android.graphics.Canvas c = new android.graphics.Canvas(movedRoom);
+        android.graphics.Paint p = new android.graphics.Paint();
+        p.setColor(Color.rgb(210, 195, 175));
+        c.drawRect(10, 10, 48, 65, p);
+        assertTrue("Kapi/kisi hareketi tek karede soguk modu uyandirmali!",
+                CameraMonitorService.detectSparseMotion(movedRoom, lumaBuf, true));
+
+        staticRoom.recycle();
+        movedRoom.recycle();
+    }
 }

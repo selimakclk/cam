@@ -163,6 +163,14 @@ public final class RoomBackgroundMask {
         return 0.06f + ((diff - 26f) / 40f) * 0.94f;
     }
 
+    public int getWidth() {
+        return width;
+    }
+
+    public int getHeight() {
+        return height;
+    }
+
     public boolean isPixelLearned(int pixelIdx) {
         return pixelIdx >= 0 && pixelIdx < totalPixels && (bgConfidence[pixelIdx] & 0xFF) >= MIN_CONF_FOR_MASK;
     }
@@ -173,5 +181,39 @@ public final class RoomBackgroundMask {
             if ((bgConfidence[i] & 0xFF) >= MIN_CONF_FOR_MASK) learned++;
         }
         return (float) learned / totalPixels;
+    }
+
+    /**
+     * Asenkron OSNet kırpımı için tüm karenin ön plan ağırlıklarını [0..255] bayt tamponuna kopyalar (~0.04 ms).
+     * Yalnızca arka plan en az %20 oranında öğrenildiyse true döner; aksi halde OSNet ham pikselleri kullanır.
+     */
+    public boolean snapshotForegroundBytes(int[] argbPixels, byte[] dstMask255) {
+        if (argbPixels == null || dstMask255 == null
+                || argbPixels.length < totalPixels || dstMask255.length < totalPixels) {
+            return false;
+        }
+        int learned = 0;
+        for (int idx = 0; idx < totalPixels; idx++) {
+            if ((bgConfidence[idx] & 0xFF) < MIN_CONF_FOR_MASK) {
+                dstMask255[idx] = (byte) 255;
+                continue;
+            }
+            learned++;
+            int argb = argbPixels[idx];
+            int r = (argb >> 16) & 0xFF;
+            int g = (argb >> 8) & 0xFF;
+            int b = argb & 0xFF;
+            float diff = Math.abs(r - bgR[idx]) + Math.abs(g - bgG[idx]) + Math.abs(b - bgB[idx]);
+            int w255;
+            if (diff <= 26f) {
+                w255 = 15; // ~0.06
+            } else if (diff >= 66f) {
+                w255 = 255;
+            } else {
+                w255 = 15 + Math.round(((diff - 26f) / 40f) * 240f);
+            }
+            dstMask255[idx] = (byte) w255;
+        }
+        return ((float) learned / totalPixels) >= 0.20f;
     }
 }

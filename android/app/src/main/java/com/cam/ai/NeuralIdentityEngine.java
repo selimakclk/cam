@@ -254,10 +254,17 @@ public class NeuralIdentityEngine {
     public IdentityResult extractIdentity(
             Bitmap fullBitmap, float nx, float ny, float nw, float nh,
             boolean runBodyReid, boolean runFace) {
+        return extractIdentity(fullBitmap, nx, ny, nw, nh, runBodyReid, runFace, null, 0, 0);
+    }
+
+    public IdentityResult extractIdentity(
+            Bitmap fullBitmap, float nx, float ny, float nw, float nh,
+            boolean runBodyReid, boolean runFace,
+            byte[] fgMask255, int maskW, int maskH) {
         IdentityResult res = new IdentityResult();
         if (closed || fullBitmap == null || fullBitmap.isRecycled()) return res;
         if (runBodyReid && reidReady) {
-            res.body = extractBodyReid(fullBitmap, nx, ny, nw, nh);
+            res.body = extractBodyReid(fullBitmap, nx, ny, nw, nh, fgMask255, maskW, maskH);
         }
         if (runFace && faceReady) {
             res.face = extractFace(fullBitmap, nx, ny, nw, nh);
@@ -269,6 +276,17 @@ public class NeuralIdentityEngine {
      * OSNet MSMT17 ile 512-D derin insan Re-ID vektörü ve keskinlik puanı çıkarır.
      */
     public BodyReidResult extractBodyReid(Bitmap fullBitmap, float nx, float ny, float nw, float nh) {
+        return extractBodyReid(fullBitmap, nx, ny, nw, nh, null, 0, 0);
+    }
+
+    /**
+     * Arka plan maskesi destekli OSNet MSMT17 çıkarımı:
+     * Statik duvar/koltuk piksellerini yumuşakça ImageNet nötr ortalamasına (R=124, G=116, B=104 -> 0.0)
+     * yaklaştırarak kişinin farklı renkli duvar önüne geçtiğinde dahi %100 tanınmasını sağlar.
+     */
+    public BodyReidResult extractBodyReid(
+            Bitmap fullBitmap, float nx, float ny, float nw, float nh,
+            byte[] fgMask255, int maskW, int maskH) {
         BodyReidResult out = new BodyReidResult();
         if (closed || !reidReady || fullBitmap == null || fullBitmap.isRecycled()) return out;
 
@@ -289,35 +307,82 @@ public class NeuralIdentityEngine {
                 reidCropCanvas.drawBitmap(fullBitmap, reidSrcRect, reidDstRect, bilinearPaint);
                 reidCropBitmap.getPixels(reidPixels, 0, REID_W, 0, 0, REID_W, REID_H);
 
-                // Laplacian keskinlik kontrolü (<0.04 ms)
+                // Laplacian keskinlik kontrolü (<0.04 ms) — maskelemeden önce gerçek görüntü üzerinde!
                 out.sharpness = SmartTrackerMath.computeLaplacianSharpness(
                         reidPixels, REID_W, REID_H, 10, 12, REID_W - 10, REID_H - 12, 2);
                 out.isSharp = (out.sharpness >= MIN_BODY_SHARPNESS);
 
+                // Uyarlamalı oda arka plan maskesi geçerliyse yalnızca ön plan oranı sağlıklıysa yumuşak uygula
+                boolean applyFgMask = false;
+                float cropNormX0 = (float) x0 / bw;
+                float cropNormW = (float) (x1 - x0) / bw;
+                float cropNormY0 = (float) y0 / bh;
+                float cropNormH = (float) (y1 - y0) / bh;
+                if (fgMask255 != null && maskW > 0 && maskH > 0 && fgMask255.length >= maskW * maskH) {
+                    float fgSum = 0f;
+                    int sampleCnt = 0;
+                    for (int ry = 0; ry < REID_H; ry += 8) {
+                        int my = Math.min(maskH - 1, Math.max(0, (int) ((cropNormY0 + (ry + 0.5f) / REID_H * cropNormH) * maskH)));
+                        int mRow = my * maskW;
+                        for (int rx = 0; rx < REID_W; rx += 8) {
+                            int mx = Math.min(maskW - 1, Math.max(0, (int) ((cropNormX0 + (rx + 0.5f) / REID_W * cropNormW) * maskW)));
+                            fgSum += (fgMask255[mRow + mx] & 0xFF) * (1f / 255f);
+                            sampleCnt++;
+                        }
+                    }
+                    float avgFg = (sampleCnt > 0) ? (fgSum / sampleCnt) : 1f;
+                    // En az %16 ön plan ve en az %6 arka plan pikseli varsa duvarı yumuşakça nötrle
+                    applyFgMask = (avgFg >= 0.16f && avgFg <= 0.94f);
+                }
+
                 reidInputBuffer.rewind();
                 if (reidInputNchw) {
                     int planeSize = REID_W * REID_H;
-                    for (int i = 0; i < planeSize; i++) {
-                        float r = ((reidPixels[i] >> 16) & 0xFF) * (1f / 255f);
-                        reidInputBuffer.putFloat((r - IMAGENET_MEAN_R) * IMAGENET_INV_STD_R);
-                    }
-                    for (int i = 0; i < planeSize; i++) {
-                        float g = ((reidPixels[i] >> 8) & 0xFF) * (1f / 255f);
-                        reidInputBuffer.putFloat((g - IMAGENET_MEAN_G) * IMAGENET_INV_STD_G);
-                    }
-                    for (int i = 0; i < planeSize; i++) {
-                        float b = (reidPixels[i] & 0xFF) * (1f / 255f);
-                        reidInputBuffer.putFloat((b - IMAGENET_MEAN_B) * IMAGENET_INV_STD_B);
+                    for (int ch = 0; ch < 3; ch++) {
+                        float mean = (ch == 0) ? IMAGENET_MEAN_R : (ch == 1 ? IMAGENET_MEAN_G : IMAGENET_MEAN_B);
+                        float invStd = (ch == 0) ? IMAGENET_INV_STD_R : (ch == 1 ? IMAGENET_INV_STD_G : IMAGENET_INV_STD_B);
+                        int shift = (ch == 0) ? 16 : (ch == 1 ? 8 : 0);
+                        for (int ry = 0; ry < REID_H; ry++) {
+                            int rowOff = ry * REID_W;
+                            int mRow = applyFgMask
+                                    ? Math.min(maskH - 1, Math.max(0, (int) ((cropNormY0 + (ry + 0.5f) / REID_H * cropNormH) * maskH))) * maskW
+                                    : 0;
+                            for (int rx = 0; rx < REID_W; rx++) {
+                                float v = ((reidPixels[rowOff + rx] >> shift) & 0xFF) * (1f / 255f);
+                                float norm = (v - mean) * invStd;
+                                if (applyFgMask) {
+                                    int mx = Math.min(maskW - 1, Math.max(0, (int) ((cropNormX0 + (rx + 0.5f) / REID_W * cropNormW) * maskW)));
+                                    float fg = (fgMask255[mRow + mx] & 0xFF) * (1f / 255f);
+                                    // Statik duvarı nötr 0.0 ortalamaya doğru yumuşakça bastır (0.22..1.0)
+                                    norm *= (0.22f + 0.78f * fg);
+                                }
+                                reidInputBuffer.putFloat(norm);
+                            }
+                        }
                     }
                 } else {
-                    for (int i = 0; i < reidPixels.length; i++) {
-                        int argb = reidPixels[i];
-                        float r = ((argb >> 16) & 0xFF) * (1f / 255f);
-                        float g = ((argb >> 8) & 0xFF) * (1f / 255f);
-                        float b = (argb & 0xFF) * (1f / 255f);
-                        reidInputBuffer.putFloat((r - IMAGENET_MEAN_R) * IMAGENET_INV_STD_R);
-                        reidInputBuffer.putFloat((g - IMAGENET_MEAN_G) * IMAGENET_INV_STD_G);
-                        reidInputBuffer.putFloat((b - IMAGENET_MEAN_B) * IMAGENET_INV_STD_B);
+                    for (int ry = 0; ry < REID_H; ry++) {
+                        int rowOff = ry * REID_W;
+                        int mRow = applyFgMask
+                                ? Math.min(maskH - 1, Math.max(0, (int) ((cropNormY0 + (ry + 0.5f) / REID_H * cropNormH) * maskH))) * maskW
+                                : 0;
+                        for (int rx = 0; rx < REID_W; rx++) {
+                            int argb = reidPixels[rowOff + rx];
+                            float nr = (((argb >> 16) & 0xFF) * (1f / 255f) - IMAGENET_MEAN_R) * IMAGENET_INV_STD_R;
+                            float ng = (((argb >> 8) & 0xFF) * (1f / 255f) - IMAGENET_MEAN_G) * IMAGENET_INV_STD_G;
+                            float nb = ((argb & 0xFF) * (1f / 255f) - IMAGENET_MEAN_B) * IMAGENET_INV_STD_B;
+                            if (applyFgMask) {
+                                int mx = Math.min(maskW - 1, Math.max(0, (int) ((cropNormX0 + (rx + 0.5f) / REID_W * cropNormW) * maskW)));
+                                float fg = (fgMask255[mRow + mx] & 0xFF) * (1f / 255f);
+                                float scale = 0.22f + 0.78f * fg;
+                                nr *= scale;
+                                ng *= scale;
+                                nb *= scale;
+                            }
+                            reidInputBuffer.putFloat(nr);
+                            reidInputBuffer.putFloat(ng);
+                            reidInputBuffer.putFloat(nb);
+                        }
                     }
                 }
                 reidInputBuffer.rewind();

@@ -156,8 +156,19 @@ public class CameraMonitorService extends Service implements LifecycleOwner {
     private Bitmap aiWorkBitmap = null;
     private Canvas aiWorkCanvas = null;
     private final Matrix uprightMatrix = new Matrix();
-    private final Paint uprightPaint = new Paint();
+    private final Paint uprightPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
     private final ByteArrayOutputStream reusableJpegOut = new ByteArrayOutputStream(24576);
+
+    // Termal Kısma Koruması & Akıllı Boş Oda Soğuk Modu (v3.2):
+    // Odada 4 sn boyunca hiç kişi ve piksel hareketi yoksa AI taraması ~4 FPS'e sakinleşir;
+    // en ufak piksel hareketinde <33 ms'de (tek karede) anında tam hıza geri fırlar!
+    public static final long ECO_IDLE_TRIGGER_MS = 4000L;
+    public static final long ECO_AI_INTERVAL_MS = 260L;
+    private final int[] motionProbeLuma = new int[64];
+    private boolean hasMotionProbe = false;
+    private volatile long lastSceneActivityTs = System.currentTimeMillis();
+    private volatile long lastAiDispatchTs = 0L;
+    private volatile boolean thermalEcoMode = false;
 
     @NonNull
     @Override
@@ -574,6 +585,47 @@ public class CameraMonitorService extends Service implements LifecycleOwner {
         return wifiLock != null && wifiLock.isHeld();
     }
 
+    public boolean isThermalEcoModeActive() {
+        return thermalEcoMode;
+    }
+
+    /**
+     * 8x8 seyrek örnekleme (64 piksel, <0.01 ms) ile sahnede hareket olup olmadığını ölçer.
+     * Döndürülen değer: (ortalama fark >= 6.5 veya tek nokta sıçraması >= 24) ise true.
+     */
+    public static boolean detectSparseMotion(Bitmap bmp, int[] prevLuma64, boolean hasPrev) {
+        if (bmp == null || bmp.isRecycled() || prevLuma64 == null || prevLuma64.length < 64) {
+            return true;
+        }
+        int w = bmp.getWidth();
+        int h = bmp.getHeight();
+        if (w < 8 || h < 8) return true;
+
+        int sumDiff = 0;
+        int maxDiff = 0;
+        int idx = 0;
+        for (int gy = 0; gy < 8; gy++) {
+            int py = (int) (((gy + 0.5f) / 8f) * h);
+            if (py >= h) py = h - 1;
+            for (int gx = 0; gx < 8; gx++) {
+                int px = (int) (((gx + 0.5f) / 8f) * w);
+                if (px >= w) px = w - 1;
+                int argb = bmp.getPixel(px, py);
+                int lum = (((argb >> 16) & 0xFF) * 77 + ((argb >> 8) & 0xFF) * 150 + (argb & 0xFF) * 29) >> 8;
+                if (hasPrev) {
+                    int d = Math.abs(lum - prevLuma64[idx]);
+                    sumDiff += d;
+                    if (d > maxDiff) maxDiff = d;
+                }
+                prevLuma64[idx] = lum;
+                idx++;
+            }
+        }
+        if (!hasPrev) return true;
+        float meanDiff = sumDiff / 64f;
+        return meanDiff >= 6.5f || maxDiff >= 24;
+    }
+
     // =================== 30 FPS KARE + ASENKRON 4-MODELLİ AI İŞLEME ===================
     private void analyzeImageProxy(@NonNull ImageProxy imageProxy) {
         PersonDetectorEngine eng = personEngine;
@@ -650,8 +702,24 @@ public class CameraMonitorService extends Service implements LifecycleOwner {
                 });
             }
 
-            // 3. Arka plan AI iş parçacığı boşsa yeni kareyi asenkron teslim et (EKRAN KAPALIYKEN DE ÇALIŞIR!)
-            if (eng.isInitialized() && aiBusy.compareAndSet(false, true)) {
+            // 3. Termal Kısma Koruması: Boş + hareketsiz odada 4 sn sonra ~4 FPS soğuk moda geç,
+            //    en ufak hareket / kişi / kilit / yayın durumunda <33 ms'de anında tam hıza dön!
+            boolean motionDetected = detectSparseMotion(upright, motionProbeLuma, hasMotionProbe);
+            hasMotionProbe = true;
+            boolean hasActiveLockOrPerson = (fastLocked != null) || !latestAiPersons.isEmpty();
+            boolean viewerStreamingNow = (srv != null && srv.hasActiveVideoStream());
+            if (motionDetected || hasActiveLockOrPerson || viewerStreamingNow) {
+                lastSceneActivityTs = now;
+                thermalEcoMode = false;
+            } else if (now - lastSceneActivityTs >= ECO_IDLE_TRIGGER_MS) {
+                thermalEcoMode = true;
+            }
+
+            boolean allowAiDispatch = !thermalEcoMode || (now - lastAiDispatchTs >= ECO_AI_INTERVAL_MS);
+
+            // 4. Arka plan AI iş parçacığı boşsa yeni kareyi asenkron teslim et (EKRAN KAPALIYKEN DE ÇALIŞIR!)
+            if (allowAiDispatch && eng.isInitialized() && aiBusy.compareAndSet(false, true)) {
+                lastAiDispatchTs = now;
                 try {
                     if (aiWorkBitmap == null || aiWorkBitmap.isRecycled()
                             || aiWorkBitmap.getWidth() != bw || aiWorkBitmap.getHeight() != bh) {

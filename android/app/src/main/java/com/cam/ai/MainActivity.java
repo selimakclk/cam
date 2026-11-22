@@ -562,7 +562,11 @@ public class MainActivity extends AppCompatActivity {
         } else if (count > 0) {
             newStatus = "Canlı • Ekran Kapalı Çalışır (" + count + " Kişi)";
         } else {
-            newStatus = "Canlı • Ekran Kapalı Çalışır • Aranıyor...";
+            CameraMonitorService svc = CameraMonitorService.getInstance();
+            boolean eco = (svc != null && svc.isThermalEcoModeActive());
+            newStatus = eco
+                    ? "Canlı • Soğuk Mod (Hareket Bekliyor)"
+                    : "Canlı • Ekran Kapalı Çalışır • Aranıyor...";
         }
 
         if (!newStatus.equals(lastStatusText)) {
